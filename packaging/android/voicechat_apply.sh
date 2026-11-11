@@ -52,7 +52,7 @@ mkdir -p "$work/raw_bundles" "$work/mods" "$work/api_mods" "$work/native_data" "
 python3 "$source/packaging/android/native_stage_bundles.py" "$work" "$commit" "$source/native-mods/voicechat"
 python3 "$source/packaging/android/native_mod_adapt.py" "$work/source" "$work/mods"
 
-cargo fetch --locked --manifest-path "$work/source/Cargo.toml" > /dev/null
+cargo fetch --manifest-path "$work/source/Cargo.toml" > /dev/null
 "$tools/bin/horizon-mixins" apply --workspace "$work/source" --mods "$work/mods" --out "$work/stage"
 
 # The applied tree replaces the checkout's files (the Android library keeps its real path).
