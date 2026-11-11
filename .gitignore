@@ -59,3 +59,6 @@
 
 # Local PR description draft.
 /PR_DESCRIPTION.txt
+
+# Opus source for the voice chat engine, fetched by packaging/android/fetch_opus.sh
+native-mods/voicechat/mixins/voicechat/engine/opus/

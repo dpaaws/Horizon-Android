@@ -3,6 +3,8 @@ package dev.horizon.android;
 /** SAF result callback only. The native activity, UI and file operations stay Rust. */
 public final class HorizonActivity extends android.app.NativeActivity {
     private static final int REQUEST_MOD_PERMISSIONS = 3;
+    /** This build has the voice chat compiled in (packaging/android/voicechat_apply.sh): it uses the microphone. */
+    private static final boolean BAKED_MICROPHONE = true;
     private static final String RELEASE_SIGNER =
             "b83e95a3ff2ff82509300f132506d61b1ca3572a61e80b8588f8be815f7b9b05";
     private boolean loaded;
@@ -96,17 +98,21 @@ public final class HorizonActivity extends android.app.NativeActivity {
     }
 
     private void askModPermissions() {
-        if (nativeLibrary == null) {
-            return;
-        }
-        final java.util.Map<String, java.util.List<String>> wanted = NativeMods.permissions(nativeLibrary);
-        if (wanted == null || wanted.isEmpty() || NativeMods.permissionsDeclined(nativeLibrary)) {
-            return;
-        }
         java.util.ArrayList<String> permList = new java.util.ArrayList<>();
-        for (String key : wanted.keySet()) {
-            if ("microphone".equalsIgnoreCase(key)) {
+        if (nativeLibrary == null) {
+            // The APK's own game: only a mod compiled into it asks (Android remembers a refusal).
+            if (BAKED_MICROPHONE) {
                 permList.add(android.Manifest.permission.RECORD_AUDIO);
+            }
+        } else {
+            final java.util.Map<String, java.util.List<String>> wanted = NativeMods.permissions(nativeLibrary);
+            if (wanted == null || wanted.isEmpty() || NativeMods.permissionsDeclined(nativeLibrary)) {
+                return;
+            }
+            for (String key : wanted.keySet()) {
+                if ("microphone".equalsIgnoreCase(key)) {
+                    permList.add(android.Manifest.permission.RECORD_AUDIO);
+                }
             }
         }
         if (permList.isEmpty()) {
