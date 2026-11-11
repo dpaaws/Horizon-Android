@@ -12,10 +12,6 @@ build = "build.rs"
 libloading = "0.8"
 ring = "0.17"
 
-# Computers: the sound card through cpal, Opus from the system's libopus.
-[target.'cfg(not(target_os = "android"))'.dependencies]
-cpal = "0.16"
-
 # Android: AAudio (libaaudio.so, loaded at run time) and an Opus compiled in from opus/ (build.rs).
 [build-dependencies]
 cc = "1"
