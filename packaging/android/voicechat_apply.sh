@@ -48,6 +48,21 @@ lib_attr_alt='#![forbid(unsafe_code)]'
 grep -vxF "$lib_attr" "$work/source/$lib" | grep -vxF "$lib_attr_alt" > "$work/lib.rs"
 cp "$work/lib.rs" "$work/source/$lib"
 
+# This fork's native-hooks.json lists hooks without the `version` horizon-mixins requires (they are all
+# the first version): fill it in, in the work copy.
+python3 - "$work/source/native-hooks.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+catalog = json.load(open(path, encoding="utf-8"))
+filled = 0
+for hook in catalog["hooks"]:
+    if "version" not in hook:
+        hook["version"] = 1
+        filled += 1
+json.dump(catalog, open(path, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
+print(f"voicechat_apply: native-hooks.json: version 1 added to {filled} hooks")
+PY
+
 mkdir -p "$work/raw_bundles" "$work/mods" "$work/api_mods" "$work/native_data" "$work/native_content"
 python3 "$source/packaging/android/native_stage_bundles.py" "$work" "$commit" "$source/native-mods/voicechat"
 python3 "$source/packaging/android/native_mod_adapt.py" "$work/source" "$work/mods"
