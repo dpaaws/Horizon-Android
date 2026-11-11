@@ -1,6 +1,6 @@
-// The menu key (V) opens the voice chat menu; push to talk and whisper while
-// held; mute and voice chat off/on on a press. A key goes down only while
-// playing, but letting go always counts.
+// The menu key (V) answers `/vc status` in the chat (this Horizon has no screen of a mod's own: groups
+// are `/vc groups`, `/vc join`, `/vc create`); push to talk and whisper while held; mute and voice
+// chat off/on on a press. A key goes down only while playing, but letting go always counts.
 fn voicechat_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
     use voicechat_engine as vc;
     if !game.native_on(vc::ID) {
@@ -8,9 +8,15 @@ fn voicechat_key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
     }
     let menu = game.native_mod_key(vc::ID, vc::KEY_MENU, vc::DEFAULT_MENU);
     if pressed && key == menu && menu != "key.keyboard.unknown" && game.native_playing() {
-        vc::menu_open(vc::key_char(key));
-        if !game.native_mod_screen_open(vc::ID) {
-            vc::menu_sync(false);
+        {
+            let game = &*game;
+            vc::load(&|k| game.native_setting(vc::ID, k));
+        }
+        for line in vc::command("vc status").unwrap_or_default() {
+            game.native_chat(&line);
+        }
+        for (k, v) in vc::take_store() {
+            game.native_set_setting(vc::ID, &k, &v);
         }
         return;
     }

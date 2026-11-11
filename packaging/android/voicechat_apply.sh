@@ -73,6 +73,23 @@ cargo fetch --manifest-path "$work/source/Cargo.toml" > /dev/null
 # The applied tree replaces the checkout's files (the Android library keeps its real path).
 rsync -a --exclude /.git --exclude /.local --exclude /target --exclude "/crates/horizon-android/plan-stub.rs" "$work/stage/" "$source/"
 cp "$work/android-Cargo.toml" "$source/$manifest"
+# The Android library compiles horizon-client's own source files (android_lib.rs), so the bundle
+# crates the stage added to horizon-client's dependencies must be the library's as well.
+python3 - "$work/stage/crates/horizon-client/Cargo.toml" "$source/$manifest" <<'PY'
+import re, sys
+client = open(sys.argv[1], encoding="utf-8").read()
+android = open(sys.argv[2], encoding="utf-8").read()
+lines = re.findall(r'^voicechat-engine\s*=.*$', client, re.M)
+if len(lines) != 1:
+    sys.exit("voicechat_apply: horizon-client has no voicechat-engine dependency after the stage")
+if re.search(r'^voicechat-engine\s*=', android, re.M):
+    sys.exit(0)
+android, n = re.subn(r'^\[dependencies\]\n', lambda m: m.group(0) + lines[0] + "\n", android, count=1, flags=re.M)
+if n != 1:
+    sys.exit("voicechat_apply: horizon-android has no [dependencies] table")
+open(sys.argv[2], "w", encoding="utf-8").write(android)
+print("voicechat_apply: horizon-android depends on", lines[0])
+PY
 cp "$work/stage_mods.json" "$source/.horizon-mixins-stage.json"
 echo "$commit" > "$source/.voicechat-applied"
 echo "voicechat_apply: voice chat applied on $commit"
