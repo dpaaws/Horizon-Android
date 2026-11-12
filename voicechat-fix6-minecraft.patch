@@ -1,0 +1,2063 @@
+diff --git a/crates/horizon-client-render/src/settings.rs b/crates/horizon-client-render/src/settings.rs
+index 1881f61..0abdc7d 100644
+--- a/crates/horizon-client-render/src/settings.rs
++++ b/crates/horizon-client-render/src/settings.rs
+@@ -371,6 +371,12 @@ impl Settings {
+                 ..Self::default()
+             },
+         };
++        #[cfg(target_os = "android")]
++        let settings = {
++            let mut settings = settings;
++            settings.apply_low_end_once(path);
++            settings
++        };
+         settings.describe_for_crashes();
+         // Options.load: the backend asked for at startup, what a restart is measured from.
+         Self {
+@@ -378,6 +384,39 @@ impl Settings {
+             ..settings
+         }
+     }
++    /// The first start of this build on Android: settings for a weak phone
++    /// (3 GB of memory, an entry-level GPU: Vivo Y12, Helio P22), once.
++    /// Everything stays changeable in Options > Video afterwards, and the
++    /// marker file keeps later starts from touching what the player chose.
++    #[cfg(target_os = "android")]
++    fn apply_low_end_once(&mut self, path: &Path) {
++        let Some(dir) = path.parent() else { return };
++        let marker = dir.join("horizon-lowend-v1");
++        if marker.exists() {
++            return;
++        }
++        crate::graphics::apply_preset(crate::graphics::Preset::Performance, self);
++        self.render_distance = 6;
++        self.simulation_distance = 5;
++        self.max_fps = 30;
++        self.vsync = false;
++        self.smooth_lighting = false;
++        self.vignette = false;
++        self.chunk_fade = 0.0;
++        self.entity_distance = 0.5;
++        self.weather_radius = 3;
++        let g = &mut self.horizon;
++        g.resolution_scale = 50;
++        g.far_detail = crate::graphics::FarDetail::Reduced;
++        g.animated_textures = false;
++        g.fxaa = false;
++        g.taa = false;
++        g.shadow_cache = false;
++        g.workers = 3;
++        g.texture_budget_mib = 768;
++        self.save(path);
++        let _ = fs::write(marker, "applied\n");
++    }
+     /// The render settings and resource packs a crash report lists.
+     fn describe_for_crashes(&self) {
+         let on = |b: bool| if b { "on" } else { "off" };
+diff --git a/crates/horizon-client/src/game/native_hooks.rs b/crates/horizon-client/src/game/native_hooks.rs
+index d9f9101..7e3e742 100644
+--- a/crates/horizon-client/src/game/native_hooks.rs
++++ b/crates/horizon-client/src/game/native_hooks.rs
+@@ -10114,6 +10114,11 @@ impl Game<'_> {
+         let charts = self.debug_charts.corners(!self.has_singleplayer_server());
+         !debug_takes(corner, self.debug, charts)
+     }
++    /// Another player's face and the hat over it, `0xRRGGBB` pixels (`0` where
++    /// the skin has no hat): None until their profile's skin is known.
++    pub(super) fn native_player_head(&self, name: &str) -> Option<([[u32; 8]; 8], [[u32; 8]; 8])> {
++        crate::skin_head::head_remote(name).map(|h| (h.front, h.hat))
++    }
+     /// The width of `text` in GUI pixels.
+     pub(super) fn native_text_width(&self, text: &str) -> f32 {
+         HudBatch::text_width(&self.gui.atlas, text)
+diff --git a/crates/horizon-client/src/skin_head.rs b/crates/horizon-client/src/skin_head.rs
+index 7cdbc3e..32fa55b 100644
+--- a/crates/horizon-client/src/skin_head.rs
++++ b/crates/horizon-client/src/skin_head.rs
+@@ -68,6 +68,29 @@ pub fn head(player: &str) -> Option<HeadSkin> {
+     None
+ }
+ 
++/// The head of another player, from the public profile: like [`head`] without
++/// the account's own prepared skin, which would wrongly stand for any name.
++/// `None` while the request is in flight and for names with no profile.
++pub fn head_remote(player: &str) -> Option<HeadSkin> {
++    let name = player.trim();
++    if name.is_empty() || name.len() > 16 || name.contains(char::is_whitespace) {
++        return None;
++    }
++    let mut map = cache().lock().unwrap_or_else(|e| e.into_inner());
++    if let Some(found) = map.get(name) {
++        return *found;
++    }
++    map.insert(name.to_owned(), None);
++    let wanted = name.to_owned();
++    std::thread::spawn(move || {
++        let found = fetch(&wanted);
++        if let Ok(mut map) = cache().lock() {
++            map.insert(wanted, found);
++        }
++    });
++    None
++}
++
+ /// The skin this launch will actually use, already normalized to 64x64 RGBA.
+ fn prepared_skin() -> Option<HeadSkin> {
+     let appearance = crate::skins::appearance::current()?;
+diff --git a/native-mods/voicechat/mixins/voicechat/click.rs b/native-mods/voicechat/mixins/voicechat/click.rs
+deleted file mode 100644
+index 07266c5..0000000
+--- a/native-mods/voicechat/mixins/voicechat/click.rs
++++ /dev/null
+@@ -1,15 +0,0 @@
+-// A click on the settings page: the button's setting moves to its next value.
+-fn voicechat_click(game: &mut crate::game::Game<'_>, mod_id: &str, button: usize) {
+-    use voicechat_engine as vc;
+-    if mod_id != vc::ID {
+-        return;
+-    }
+-    {
+-        let game = &*game;
+-        vc::load(&|k| game.native_setting(vc::ID, k));
+-    }
+-    vc::settings_click(button);
+-    for (k, v) in vc::take_store() {
+-        game.native_set_setting(vc::ID, &k, &v);
+-    }
+-}
+diff --git a/native-mods/voicechat/mixins/voicechat/engine/src/labels.rs b/native-mods/voicechat/mixins/voicechat/engine/src/labels.rs
+index 4d4d201..7c81836 100644
+--- a/native-mods/voicechat/mixins/voicechat/engine/src/labels.rs
++++ b/native-mods/voicechat/mixins/voicechat/engine/src/labels.rs
+@@ -59,21 +59,30 @@ pub const RANGE: f64 = 64.0;
+ /// Above the eyes, clear of the name tag.
+ const ABOVE_EYES: f64 = 0.95;
+ 
+-/// A label's text centred at `at` (GUI pixels), in `rgb`.
++/// A label centred at `at` (GUI pixels): the group's text in `rgb`, and a
++/// talking mark when the player is heard now (`Some(true)` for a whisper).
+ #[derive(Clone, Debug, PartialEq)]
+ pub struct Label {
+     pub text: String,
+     pub at: [f32; 2],
+     pub rgb: u32,
++    pub speaking: Option<bool>,
+ }
+ 
+-/// The labels for `players` (eye position, group name, whether it is the
+-/// player's own group), the farthest first so the nearest draws on top.
+-pub fn place(camera: &Camera, size: [f32; 2], players: &[([f64; 3], String, bool)]) -> Vec<Label> {
++/// What to mark on a player: the eye position, the group's name and whether it
++/// is the player's own, and whether the player is heard.
++pub struct Tag {
++    pub eye: [f64; 3],
++    pub group: Option<(String, bool)>,
++    pub speaking: Option<bool>,
++}
++
++/// The labels for `players`, the farthest first so the nearest draws on top.
++pub fn place(camera: &Camera, size: [f32; 2], players: &[Tag]) -> Vec<Label> {
+     let mut placed: Vec<(f64, Label)> = players
+         .iter()
+-        .filter_map(|(eye, group, ours)| {
+-            let point = [eye[0], eye[1] + ABOVE_EYES, eye[2]];
++        .filter_map(|t| {
++            let point = [t.eye[0], t.eye[1] + ABOVE_EYES, t.eye[2]];
+             let d = sub(point, camera.pos);
+             let distance = dot(d, d).sqrt();
+             if distance > RANGE {
+@@ -82,7 +91,11 @@ pub fn place(camera: &Camera, size: [f32; 2], players: &[([f64; 3], String, bool
+             let at = project(camera, point, size)?;
+             let on_screen = (0.0..=size[0]).contains(&at[0]) && (0.0..=size[1]).contains(&at[1]);
+             on_screen.then(|| {
+-                (distance, Label { text: format!("[{group}]"), at, rgb: if *ours { 0x55FF55 } else { 0xFFFF55 } })
++                let (text, rgb) = match &t.group {
++                    Some((name, ours)) => (format!("[{name}]"), if *ours { 0x55FF55 } else { 0xFFFF55 }),
++                    None => (String::new(), 0xFFFFFF),
++                };
++                (distance, Label { text, at, rgb, speaking: t.speaking })
+             })
+         })
+         .collect();
+@@ -98,12 +111,8 @@ mod tests {
+     fn a_player_ahead_gets_a_label_above_the_middle() {
+         let camera = Camera { pos: [0.0, 65.62, 0.0], yaw: 0.0, pitch: 0.0, fov: 70.0 };
+         let size = [400.0, 200.0];
+-        let players = vec![
+-            ([0.0, 65.62, 10.0], "Builders".to_owned(), false),
+-            ([0.0, 65.62, 5.0], "Mine".to_owned(), true),
+-            ([0.0, 65.62, -10.0], "Behind".to_owned(), false),
+-            ([0.0, 65.62, 100.0], "Far".to_owned(), false),
+-        ];
++        let tag = |z: f64, name: &str, ours: bool| Tag { eye: [0.0, 65.62, z], group: Some((name.to_owned(), ours)), speaking: None };
++        let players = vec![tag(10.0, "Builders", false), tag(5.0, "Mine", true), tag(-10.0, "Behind", false), tag(100.0, "Far", false)];
+         let labels = place(&camera, size, &players);
+         assert_eq!(labels.len(), 2);
+         // The farther one first, the nearer drawn over it.
+diff --git a/native-mods/voicechat/mixins/voicechat/engine/src/lib.rs b/native-mods/voicechat/mixins/voicechat/engine/src/lib.rs
+index 7710516..57829f9 100644
+--- a/native-mods/voicechat/mixins/voicechat/engine/src/lib.rs
++++ b/native-mods/voicechat/mixins/voicechat/engine/src/lib.rs
+@@ -8,6 +8,7 @@ pub mod audio;
+ pub mod buf;
+ pub mod crypt;
+ pub mod labels;
++pub mod look;
+ pub mod mix;
+ pub mod net;
+ pub mod opus;
+@@ -18,7 +19,7 @@ use audio::{AudioIo, Devices, MicQueue};
+ use mix::{Listener, Mixer};
+ use net::{Conn, Mode, Redirect, Shared, Status};
+ use proto::{COMPAT_26, COMPAT_27, Group, PlayerState, Secret};
+-use std::collections::HashMap;
++use std::collections::{HashMap, HashSet};
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+ use std::time::{Duration, Instant};
+@@ -44,8 +45,8 @@ pub const DEFAULT_MENU: &str = "key.keyboard.v";
+ pub const HOTKEYS: [(&str, &str, &str); 5] = [
+     (KEY_MENU, "Open this menu", DEFAULT_MENU),
+     (KEY_PTT, "Push to talk", DEFAULT_PTT),
+-    (KEY_WHISPER, "Whisper", DEFAULT_WHISPER),
+-    (KEY_MUTE, "Mute microphone", DEFAULT_MUTE),
++    (KEY_WHISPER, "Whisper (nearby only)", DEFAULT_WHISPER),
++    (KEY_MUTE, "Mute / unmute mic", DEFAULT_MUTE),
+     (KEY_DISABLE, "Voice chat off / on", DEFAULT_DISABLE),
+ ];
+ 
+@@ -83,6 +84,8 @@ pub struct Settings {
+     pub mode: Mode,
+     pub muted: bool,
+     pub disabled: bool,
++    /// Hear nobody, but stay heard.
++    pub deafened: bool,
+     pub volume: u32,
+     pub mic_gain: u32,
+     pub threshold: i32,
+@@ -98,6 +101,7 @@ impl Default for Settings {
+             mode: if cfg!(target_os = "android") { Mode::Voice } else { Mode::PushToTalk },
+             muted: false,
+             disabled: false,
++            deafened: false,
+             volume: 100,
+             mic_gain: 100,
+             threshold: -50,
+@@ -129,6 +133,7 @@ impl Settings {
+             },
+             muted: get("muted").as_deref() == Some("true"),
+             disabled: get("disabled").as_deref() == Some("true"),
++            deafened: get("deafened").as_deref() == Some("true"),
+             volume: num("volume").map_or(d.volume, |v| v.clamp(0, 200) as u32),
+             mic_gain: num("mic_gain").map_or(d.mic_gain, |v| v.clamp(10, 500) as u32),
+             threshold: num("threshold").map_or(d.threshold, |v| v.clamp(-127, 0) as i32),
+@@ -147,6 +152,7 @@ impl Settings {
+             ("mode", if self.mode == Mode::Voice { "voice" } else { "ptt" }.into()),
+             ("muted", self.muted.to_string()),
+             ("disabled", self.disabled.to_string()),
++            ("deafened", self.deafened.to_string()),
+             ("volume", self.volume.to_string()),
+             ("mic_gain", self.mic_gain.to_string()),
+             ("threshold", self.threshold.to_string()),
+@@ -289,6 +295,15 @@ struct Voice {
+     devices: Arc<Mutex<Devices>>,
+     redirect: Option<Redirect>,
+     menu: ui::Menu,
++    /// Each player's voice, in percent, and whether it is muted: what the
++    /// menu set, kept between sessions by UUID.
++    prefs: HashMap<u128, (u32, bool)>,
++    prefs_seen: HashSet<u128>,
++    started: Instant,
++}
++
++fn pref_key(kind: &str, id: u128) -> String {
++    format!("{kind}.{id:032x}")
+ }
+ 
+ fn voice() -> MutexGuard<'static, Voice> {
+@@ -306,6 +321,9 @@ fn voice() -> MutexGuard<'static, Voice> {
+             devices: Arc::new(Mutex::new(Devices::default())),
+             redirect: None,
+             menu: ui::Menu::default(),
++            prefs: HashMap::new(),
++            prefs_seen: HashSet::new(),
++            started: Instant::now(),
+         })
+     });
+     VOICE.lock().unwrap_or_else(|e| e.into_inner())
+@@ -344,6 +362,7 @@ impl Voice {
+         c.mode = s.mode;
+         c.muted = s.muted;
+         c.disabled = s.disabled;
++        c.deafened = s.deafened;
+         c.volume = s.volume as f32 / 100.0;
+         c.mic_gain = s.mic_gain as f32 / 100.0;
+         c.threshold_db = s.threshold as f32;
+@@ -355,6 +374,24 @@ impl Voice {
+         self.store.extend(stored.into_iter().map(|(k, v)| (k.to_owned(), v)));
+     }
+ 
++    /// A player's voice set to `volume` percent, or muted, now.
++    fn apply_pref(&mut self, id: u128, volume: u32, muted: bool) {
++        self.prefs.insert(id, (volume, muted));
++        let level = if muted { 0.0 } else { volume as f32 / 100.0 };
++        self.shared.controls.lock().unwrap().player_volumes.insert(id, level);
++    }
++
++    /// The same, and kept for next time.
++    fn set_pref(&mut self, id: u128, volume: u32, muted: bool) {
++        self.apply_pref(id, volume, muted);
++        self.store.push((pref_key("pv", id), volume.to_string()));
++        self.store.push((pref_key("pm", id), muted.to_string()));
++    }
++
++    fn pref(&self, id: u128) -> (u32, bool) {
++        self.prefs.get(&id).copied().unwrap_or((100, false))
++    }
++
+     fn send(&mut self, (channel, data): (&str, Vec<u8>)) {
+         self.outbox.push((channel.to_owned(), data));
+     }
+@@ -491,6 +528,19 @@ impl Voice {
+             *self.shared.listener.lock().unwrap() = l;
+         }
+         *self.shared.players.lock().unwrap() = world.players.into_iter().collect();
++        let unseen: Vec<u128> = self
++            .session
++            .as_ref()
++            .map(|s| s.states.keys().copied().filter(|id| !self.prefs_seen.contains(id)).collect())
++            .unwrap_or_default();
++        for id in unseen {
++            self.prefs_seen.insert(id);
++            let volume = get(&pref_key("pv", id)).and_then(|v| v.parse::<u32>().ok()).map(|v| v.min(300));
++            let muted = get(&pref_key("pm", id)).as_deref() == Some("true");
++            if volume.is_some() || muted {
++                self.apply_pref(id, volume.unwrap_or(100), muted);
++            }
++        }
+ 
+         let protocol = self.settings.protocol;
+         let session = self.session.as_mut().expect("made above");
+@@ -614,7 +664,7 @@ impl Voice {
+         }
+     }
+ 
+-    fn view(&self, hotkeys: Vec<(String, String)>) -> ui::View {
++    fn view(&self, hotkeys: Vec<(String, String)>, head_of: &dyn Fn(&str) -> Option<look::HeadPixels>) -> ui::View {
+         let session = self.session.as_ref();
+         let connected = session.is_some_and(|s| s.secret.is_some())
+             && *self.shared.status.lock().unwrap() == Status::Connected;
+@@ -642,10 +692,58 @@ impl Voice {
+             connected,
+             groups_enabled: session.and_then(|s| s.secret.as_ref()).is_some_and(|s| s.groups),
+             groups,
++            players: self.player_rows(head_of),
++            loopback: self.shared.controls.lock().unwrap().loopback,
+             hotkeys,
+         }
+     }
+ 
++    /// Who is heard when: talking first, then the player's group, then by name.
++    fn player_rows(&self, head_of: &dyn Fn(&str) -> Option<look::HeadPixels>) -> Vec<ui::PlayerRow> {
++        let Some(session) = self.session.as_ref() else { return Vec::new() };
++        let own = session.secret.as_ref().map(|s| s.player);
++        let eye = self.shared.listener.lock().unwrap().eye;
++        let at = self.shared.players.lock().unwrap();
++        let mut rows: Vec<ui::PlayerRow> = session
++            .states
++            .values()
++            .filter(|p| !p.disconnected && Some(p.uuid) != own)
++            .map(|p| {
++                let (volume, muted) = self.pref(p.uuid);
++                let heard = self.heard(p.uuid);
++                ui::PlayerRow {
++                    id: p.uuid,
++                    name: p.name.clone(),
++                    head: look::head_rects(head_of(&p.name).as_ref(), &p.name),
++                    talking: heard.is_some(),
++                    whisper: heard == Some(true),
++                    mic_muted: p.muted,
++                    voice_off: p.disabled,
++                    in_group: p.group.is_some() && p.group == session.group,
++                    distance: at.get(&p.uuid).map(|a| {
++                        let d = [a[0] - eye[0], a[1] - eye[1], a[2] - eye[2]];
++                        (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() as f32
++                    }),
++                    volume,
++                    muted,
++                }
++            })
++            .collect();
++        rows.sort_by_key(|r| (!r.talking, !r.in_group, r.name.to_lowercase()));
++        rows
++    }
++
++    /// Whether `id` was heard in the last moments, and if it was whispering.
++    fn heard(&self, id: u128) -> Option<bool> {
++        self.shared
++            .talking
++            .lock()
++            .unwrap()
++            .get(&id)
++            .filter(|(at, _)| at.elapsed() < Duration::from_millis(400))
++            .map(|(_, whisper)| *whisper)
++    }
++
+     /// What a click or Enter in the menu asks of the voice chat.
+     fn menu_action(&mut self, action: ui::Action) {
+         use ui::Action as A;
+@@ -658,6 +756,32 @@ impl Voice {
+             A::Mute => self.click(1),
+             A::Disable => self.click(2),
+             A::Labels => self.click(8),
++            A::Hud => self.click(7),
++            A::Deafen => {
++                self.settings.deafened = !self.settings.deafened;
++                self.save();
++            }
++            A::Loopback => {
++                let mut c = self.shared.controls.lock().unwrap();
++                c.loopback = !c.loopback;
++            }
++            A::PlayerStep(id, d) => {
++                let (volume, muted) = self.pref(id);
++                self.set_pref(id, (volume as i32 + d).clamp(0, 300) as u32, muted);
++            }
++            A::PlayerMute(id) => {
++                let (volume, muted) = self.pref(id);
++                self.set_pref(id, volume, !muted);
++            }
++            A::Slide(slider, f) => {
++                let snap = |v: f32, step: f32| (v / step).round() * step;
++                match slider {
++                    ui::Slider::Volume => self.settings.volume = snap(f * 200.0, 5.0).clamp(0.0, 200.0) as u32,
++                    ui::Slider::Gain => self.settings.mic_gain = snap(25.0 + f * 475.0, 5.0).clamp(25.0, 500.0) as u32,
++                    ui::Slider::Threshold => self.settings.threshold = (-80.0 + f * 80.0).round().clamp(-80.0, 0.0) as i32,
++                }
++                self.save();
++            }
+             A::Volume(d) => {
+                 self.settings.volume = (self.settings.volume as i32 + d).clamp(0, 200) as u32;
+                 self.save();
+@@ -748,9 +872,10 @@ pub fn menu_draw(
+     mouse: [f32; 2],
+     measure: &dyn Fn(&str) -> f32,
+     hotkeys: Vec<(String, String)>,
++    head_of: &dyn Fn(&str) -> Option<look::HeadPixels>,
+ ) -> Vec<ui::Draw> {
+     let mut v = voice();
+-    let view = v.view(hotkeys);
++    let view = v.view(hotkeys, head_of);
+     v.menu.draw(&view, size, mouse, measure)
+ }
+ 
+@@ -806,116 +931,175 @@ pub fn take_store() -> Vec<(String, String)> {
+     std::mem::take(&mut voice().store)
+ }
+ 
+-/// A line of the status the HUD shows, and its colour.
+-pub struct Line {
+-    pub text: String,
+-    pub rgb: u32,
++/// What the microphone is doing, for the HUD's icon.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum MicState {
++    /// All of voice chat is off.
++    Off,
++    Muted,
++    Idle,
++    Talking,
++    Whispering,
++    /// Not connected yet.
++    Waiting,
+ }
+ 
+-const WHITE: u32 = 0xFFFFFF;
+-const GREY: u32 = 0xAAAAAA;
+-const GREEN: u32 = 0x55FF55;
+-const AQUA: u32 = 0x55FFFF;
+-const RED: u32 = 0xFF5555;
+-const YELLOW: u32 = 0xFFFF55;
++/// A player the HUD lists as heard now.
++#[derive(Clone, Debug, PartialEq)]
++pub struct HudSpeaker {
++    pub name: String,
++    pub whisper: bool,
++    pub grouped: bool,
++    pub distance: Option<f32>,
++    /// Moves that player's bars apart from the others'.
++    pub seed: u32,
++}
+ 
+-/// The status for the HUD, top line first: nothing on a server without
+-/// voice chat.
+-pub fn hud(ptt_key: &str) -> Vec<Line> {
++/// The HUD as the game draws it: icons, a level meter and who is talking.
++#[derive(Clone, Debug, PartialEq)]
++pub struct HudView {
++    pub mic: MicState,
++    /// The microphone's level, 0 to 1, and the activation level on the same
++    /// scale (voice activation only).
++    pub level: f32,
++    pub threshold: Option<f32>,
++    pub caption: String,
++    pub deafened: bool,
++    pub group: Option<(String, usize)>,
++    /// What is wrong, in red.
++    pub problems: Vec<String>,
++    pub speakers: Vec<HudSpeaker>,
++    pub own_name: String,
++    /// Seconds, for the bars' movement.
++    pub phase: f32,
++}
++
++/// The HUD for the top left corner, or None when there is nothing to show.
++pub fn hud_view(ptt_key: &str) -> Option<HudView> {
+     let v = voice();
+-    let Some(session) = v.session.as_ref().filter(|_| v.settings.hud) else {
+-        return Vec::new();
+-    };
+-    if session.secret.is_none() {
+-        return Vec::new();
+-    }
+-    let mut lines = Vec::new();
+-    let line = |text: String, rgb| Line { text, rgb };
++    let session = v.session.as_ref().filter(|s| v.settings.hud && s.secret.is_some())?;
+     let status = v.shared.status.lock().unwrap().clone();
+-    match status {
++    let mut problems = Vec::new();
++    match &status {
+         Status::Connected => {}
+-        Status::Failed(ref e) => lines.push(line(format!("Voice chat: {e}"), RED)),
+-        _ => lines.push(line("Voice chat: connecting...".into(), YELLOW)),
++        Status::Failed(e) => problems.push(e.clone()),
++        _ => {}
+     }
+     if let Some(e) = v.shared.mic_error.lock().unwrap().as_ref() {
+-        lines.push(line(format!("Voice chat: {e}"), RED));
++        problems.push(e.clone());
+     }
+     if let Err(e) = &v.devices.lock().unwrap().input
+         && e != "not open"
+     {
+-        lines.push(line(format!("Microphone: {e}"), RED));
++        problems.push(format!("Mic: {e}"));
+     }
+     if let Err(e) = &v.devices.lock().unwrap().output
+         && e != "not open"
+     {
+-        lines.push(line(format!("Speakers: {e}"), RED));
++        problems.push(format!("Speaker: {e}"));
+     }
+-    if v.settings.disabled {
+-        lines.push(line("Voice chat off".into(), RED));
++    let level_db = v.shared.level();
++    let scale = |db: f32| ((db + 80.0) / 80.0).clamp(0.0, 1.0);
++    let transmitting = v.shared.transmitting.load(Ordering::Relaxed);
++    let whisper = v.shared.controls.lock().unwrap().whisper;
++    let connected = status == Status::Connected;
++    let (mic, caption) = if v.settings.disabled {
++        (MicState::Off, "Voice chat off".to_owned())
++    } else if !connected && problems.is_empty() {
++        (MicState::Waiting, "Connecting...".to_owned())
+     } else if v.settings.muted {
+-        lines.push(line("Microphone muted".into(), RED));
+-    } else if v.shared.transmitting.load(Ordering::Relaxed) {
+-        let whisper = v.shared.controls.lock().unwrap().whisper;
+-        lines.push(if whisper { line("Whispering".into(), AQUA) } else { line("Talking".into(), GREEN) });
+-    } else if status == Status::Connected {
+-        lines.push(match v.settings.mode {
+-            Mode::PushToTalk => line(format!("Push to talk: {}", key_label(ptt_key)), GREY),
+-            Mode::Voice => line(format!("Voice activation ({:.0} dB)", v.shared.level()), GREY),
+-        });
+-    }
+-    if let Some(g) = session.group.and_then(|g| session.groups.get(&g)) {
+-        lines.push(line(format!("Group: {}", g.name), GREEN));
+-        let mut members = session.members(g.id);
+-        members.retain(|m| *m != session.own_name());
+-        if !members.is_empty() {
+-            lines.push(line(format!("  with {}", members.join(", ")), GREY));
+-        }
+-    }
++        (MicState::Muted, "Mic muted".to_owned())
++    } else if transmitting && whisper {
++        (MicState::Whispering, "Whispering".to_owned())
++    } else if transmitting {
++        (MicState::Talking, "Talking".to_owned())
++    } else {
++        (
++            MicState::Idle,
++            match v.settings.mode {
++                Mode::PushToTalk => format!("Hold {}", key_label(ptt_key)),
++                Mode::Voice => "Auto".to_owned(),
++            },
++        )
++    };
++    let own = session.own_name();
++    let group = session
++        .group
++        .and_then(|g| session.groups.get(&g))
++        .map(|g| (g.name.clone(), session.members(g.id).len()));
++    let eye = v.shared.listener.lock().unwrap().eye;
++    let at = v.shared.players.lock().unwrap();
+     let now = Instant::now();
+-    let mut talking: Vec<(String, bool)> = v
++    let mut speakers: Vec<HudSpeaker> = v
+         .shared
+         .talking
+         .lock()
+         .unwrap()
+         .iter()
+-        .filter(|(_, (at, _))| now - *at < Duration::from_millis(300))
++        .filter(|(_, (when, _))| now - *when < Duration::from_millis(300))
+         .map(|(id, (_, whisper))| {
+-            let name = session.states.get(id).map_or_else(|| "Someone".into(), |s| s.name.clone());
+-            (name, *whisper)
++            let state = session.states.get(id);
++            let name = state.map_or_else(|| "Someone".to_owned(), |s| s.name.clone());
++            HudSpeaker {
++                seed: name.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(u32::from(b))),
++                grouped: state.is_some_and(|s| s.group.is_some() && s.group == session.group),
++                distance: at.get(id).map(|a| {
++                    let d = [a[0] - eye[0], a[1] - eye[1], a[2] - eye[2]];
++                    (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() as f32
++                }),
++                name,
++                whisper: *whisper,
++            }
+         })
+         .collect();
+-    talking.sort();
+-    for (name, whisper) in talking {
+-        lines.push(line(format!("> {name}"), if whisper { AQUA } else { WHITE }));
+-    }
+-    lines
++    speakers.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
++    Some(HudView {
++        mic,
++        level: scale(level_db),
++        threshold: (v.settings.mode == Mode::Voice).then(|| scale(v.settings.threshold as f32)),
++        caption,
++        deafened: v.settings.deafened,
++        group,
++        problems,
++        speakers,
++        own_name: own,
++        phase: v.started.elapsed().as_secs_f32(),
++    })
+ }
+ 
+-/// The group names to draw above the players the camera sees, on a `size`
+-/// screen.
++/// The group names and the talking marks to draw above the players the
++/// camera sees, on a `size` screen.
+ pub fn group_labels(camera: &labels::Camera, size: [f32; 2]) -> Vec<labels::Label> {
+     let v = voice();
+     let Some(session) = v.session.as_ref().filter(|s| v.settings.group_labels && s.secret.is_some()) else {
+         return Vec::new();
+     };
+     let players = v.shared.players.lock().unwrap();
+-    let shown: Vec<([f64; 3], String, bool)> = players
++    let shown: Vec<labels::Tag> = players
+         .iter()
+         .filter_map(|(id, eye)| {
+-            let group = session.states.get(id)?.group?;
+-            // Hidden groups stay hidden, unless they are the player's own.
+-            let g = session.groups.get(&group).filter(|g| !g.hidden || session.group == Some(group))?;
+-            Some((*eye, g.name.clone(), session.group == Some(group)))
++            let group = session.states.get(id).and_then(|p| p.group).and_then(|group| {
++                // Hidden groups stay hidden, unless they are the player's own.
++                let g = session.groups.get(&group).filter(|g| !g.hidden || session.group == Some(group))?;
++                Some((g.name.clone(), session.group == Some(group)))
++            });
++            let speaking = v.heard(*id);
++            (group.is_some() || speaking.is_some()).then(|| labels::Tag { eye: *eye, group, speaking })
+         })
+         .collect();
+     labels::place(camera, size, &shown)
+ }
+ 
++const GREY: u32 = 0xAAAAAA;
++const GREEN: u32 = 0x55FF55;
++const RED: u32 = 0xFF5555;
++const YELLOW: u32 = 0xFFFF55;
++
+ /// `key.keyboard.caps.lock` → `Caps Lock`.
+ pub fn key_label(key: &str) -> String {
+     let name = key.strip_prefix("key.keyboard.").or_else(|| key.strip_prefix("key.mouse.")).unwrap_or(key);
+     if name == "unknown" {
+-        return "not bound".into();
++        return "not set".into();
+     }
+     name.split('.')
+         .map(|w| {
+@@ -932,6 +1116,7 @@ const HELP: &[&str] = &[
+     "/vc status - the connection, devices and who has voice chat",
+     "/vc mute, /vc unmute - the microphone",
+     "/vc off, /vc on - all of voice chat",
++    "/vc deafen, /vc undeafen - hear nobody, but stay heard",
+     "/vc mode ptt|voice - push to talk or voice activation",
+     "/vc volume <0-200> - everyone's voices",
+     "/vc volume <player> <0-200> - one player's voice",
+@@ -961,6 +1146,11 @@ pub fn command(line: &str) -> Option<Vec<String>> {
+             v.send_state();
+             out(if v.settings.muted { "Microphone muted" } else { "Microphone on" })
+         }
++        ["deafen"] | ["undeafen"] => {
++            v.settings.deafened = args[0] == "deafen";
++            v.save();
++            out(if v.settings.deafened { "You hear nobody now" } else { "You hear voices again" })
++        }
+         ["off"] | ["on"] => {
+             v.settings.disabled = args[0] == "off";
+             v.save();
+@@ -993,7 +1183,8 @@ pub fn command(line: &str) -> Option<Vec<String>> {
+             });
+             match id {
+                 Some(id) => {
+-                    v.shared.controls.lock().unwrap().player_volumes.insert(id, n as f32 / 100.0);
++                    let muted = v.pref(id).1;
++                    v.set_pref(id, n, muted);
+                     vec![format!("{name}'s voice at {n}%")]
+                 }
+                 None => vec![format!("No voice chat player named {name}")],
+@@ -1146,6 +1337,30 @@ mod tests {
+         assert!(voice().session.is_none());
+     }
+ 
++    #[test]
++    fn a_players_voice_is_set_and_muted_from_the_menu_and_kept() {
++        let mut v = voice();
++        v.menu_action(ui::Action::PlayerStep(42, 10));
++        v.menu_action(ui::Action::PlayerStep(42, 10));
++        assert_eq!(v.pref(42), (120, false));
++        assert_eq!(v.shared.controls.lock().unwrap().player_volumes.get(&42), Some(&1.2));
++        v.menu_action(ui::Action::PlayerMute(42));
++        assert_eq!(v.shared.controls.lock().unwrap().player_volumes.get(&42), Some(&0.0));
++        let kept: HashMap<String, String> = v.store.drain(..).collect();
++        assert_eq!(kept.get(&pref_key("pv", 42)).map(String::as_str), Some("120"));
++        assert_eq!(kept.get(&pref_key("pm", 42)).map(String::as_str), Some("true"));
++        // Back again: the volume it had.
++        v.menu_action(ui::Action::PlayerMute(42));
++        assert_eq!(v.shared.controls.lock().unwrap().player_volumes.get(&42), Some(&1.2));
++        v.menu_action(ui::Action::Deafen);
++        assert!(v.shared.controls.lock().unwrap().deafened);
++        v.menu_action(ui::Action::Deafen);
++        assert!(!v.shared.controls.lock().unwrap().deafened);
++        v.menu_action(ui::Action::Loopback);
++        assert!(v.shared.controls.lock().unwrap().loopback);
++        v.menu_action(ui::Action::Loopback);
++    }
++
+     #[test]
+     fn shows_other_players_groups() {
+         use buf::Writer;
+@@ -1185,8 +1400,8 @@ mod tests {
+         assert_eq!(texts, vec![("[Miners]", 0xFFFF55), ("[Builders]", 0x55FF55)]);
+         let list = command("vc groups").unwrap();
+         assert_eq!(list, vec!["Builders (yours): Alex, Me", "Miners: Bea"]);
+-        let hud: Vec<String> = hud("key.keyboard.v").into_iter().map(|l| l.text).collect();
+-        assert!(hud.contains(&"Group: Builders".to_owned()) && hud.contains(&"  with Alex".to_owned()), "{hud:?}");
++        let hud = hud_view("key.keyboard.v").expect("connected");
++        assert_eq!(hud.group, Some(("Builders".to_owned(), 2)));
+ 
+         // The menu: a password group asks for its password, then joins.
+         {
+@@ -1197,10 +1412,13 @@ mod tests {
+         *voice().shared.status.lock().unwrap() = Status::Connected;
+         menu_open(Some('v'));
+         let measure = |t: &str| t.len() as f32 * 6.0;
+-        let keys = vec![("Push to talk".to_owned(), key_label(DEFAULT_PTT))];
+-        let draws = menu_draw([480.0, 270.0], [0.0, 0.0], &measure, keys.clone());
++        let keys = vec![("Open this menu".to_owned(), "V".to_owned()), ("Push to talk".to_owned(), key_label(DEFAULT_PTT))];
+         let has = |d: &[ui::Draw], want: &str| d.iter().any(|d| matches!(d, ui::Draw::Text(t, ..) if t == want));
+-        assert!(has(&draws, "Caps Lock") && has(&draws, "Miners (password)") && has(&draws, "Alex, Me"));
++        let draws = menu_draw([480.0, 270.0], [0.0, 0.0], &measure, keys.clone(), &|_| None);
++        assert!(has(&draws, "Voice volume") && has(&draws, "Hold Caps Lock to talk") == (voice().settings.mode == Mode::PushToTalk));
++        voice().menu.tab = ui::Tab::Groups;
++        let draws = menu_draw([480.0, 270.0], [0.0, 0.0], &measure, keys.clone(), &|_| None);
++        assert!(has(&draws, "Miners (password)") && has(&draws, "Alex, Me"));
+         let join = voice().menu.hit_rect(&ui::Action::Join(0x62)).unwrap();
+         tick(Some(world("groups.example.net")), &none);
+         menu_click([join[0] + 1.0, join[1] + 1.0]);
+diff --git a/native-mods/voicechat/mixins/voicechat/engine/src/look.rs b/native-mods/voicechat/mixins/voicechat/engine/src/look.rs
+new file mode 100644
+index 0000000..6833c06
+--- /dev/null
++++ b/native-mods/voicechat/mixins/voicechat/engine/src/look.rs
+@@ -0,0 +1,177 @@
++//! What the voice chat looks like: player heads and small pixel icons, as
++//! rectangles the game's HUD and the menu both draw.
++
++/// A player's face and the hat layer over it, one `0xRRGGBB` pixel each
++/// (`0` in the hat where the skin has none): the game's `HeadSkin`.
++pub type HeadPixels = ([[u32; 8]; 8], [[u32; 8]; 8]);
++
++/// One drawn rectangle: `[x, y, width, height]` and its `0xAARRGGBB`.
++pub type Rect = ([f32; 4], u32);
++
++fn hash(text: &str) -> u32 {
++    text.bytes().fold(2166136261u32, |h, b| (h ^ u32::from(b)).wrapping_mul(16777619))
++}
++
++/// A face for a player with no known skin (offline names): skin, hair and
++/// eyes from the name, so each player keeps their own.
++pub fn default_face(seed: &str) -> HeadPixels {
++    const SKINS: [u32; 4] = [0xC69C6D, 0xE0AC84, 0x9A6B4F, 0xF1C9A5];
++    const HAIRS: [u32; 5] = [0x3B2A1A, 0x1E1E1E, 0x7A4B1E, 0xB58B3A, 0x5B3A29];
++    const EYES: [u32; 3] = [0x3F5FBF, 0x2E7D4F, 0x4A3A2A];
++    let h = hash(seed);
++    let skin = SKINS[(h % 4) as usize];
++    let hair = HAIRS[((h >> 4) % 5) as usize];
++    let eye = EYES[((h >> 8) % 3) as usize];
++    let mut face = [[skin; 8]; 8];
++    for x in 0..8 {
++        face[0][x] = hair;
++        face[1][x] = if x == 0 || x == 7 { hair } else { skin };
++    }
++    face[3][1] = 0xFFFFFF;
++    face[3][2] = eye;
++    face[3][5] = eye;
++    face[3][6] = 0xFFFFFF;
++    face[5][3] = 0x8A4B3A;
++    face[5][4] = 0x8A4B3A;
++    (face, [[0; 8]; 8])
++}
++
++/// The head as rectangles at the origin, one unit a skin pixel, same-coloured
++/// neighbours joined.
++pub fn head_rects(head: Option<&HeadPixels>, seed: &str) -> Vec<Rect> {
++    let fallback;
++    let (face, hat) = match head {
++        Some(h) => h,
++        None => {
++            fallback = default_face(seed);
++            &fallback
++        }
++    };
++    let mut out = Vec::new();
++    for y in 0..8 {
++        let mut row = [0u32; 8];
++        for x in 0..8 {
++            row[x] = if hat[y][x] != 0 { hat[y][x] } else { face[y][x] };
++        }
++        let mut x = 0;
++        while x < 8 {
++            let start = x;
++            while x < 8 && row[x] == row[start] {
++                x += 1;
++            }
++            out.push(([start as f32, y as f32, (x - start) as f32, 1.0], 0xFF00_0000 | row[start]));
++        }
++    }
++    out
++}
++
++/// `rows` of pixel art (`#` is a pixel) as rectangles at the origin.
++pub fn icon_rects(rows: &[&str], rgb: u32) -> Vec<Rect> {
++    let mut out = Vec::new();
++    for (y, row) in rows.iter().enumerate() {
++        let cells: Vec<char> = row.chars().collect();
++        let mut x = 0;
++        while x < cells.len() {
++            if cells[x] == '#' {
++                let start = x;
++                while x < cells.len() && cells[x] == '#' {
++                    x += 1;
++                }
++                out.push(([start as f32, y as f32, (x - start) as f32, 1.0], 0xFF00_0000 | rgb));
++            } else {
++                x += 1;
++            }
++        }
++    }
++    out
++}
++
++pub const MIC: [&str; 10] = [
++    "..###..",
++    ".#####.",
++    ".#####.",
++    ".#####.",
++    "#.###.#",
++    "#.###.#",
++    ".#####.",
++    "..###..",
++    "...#...",
++    "..###..",
++];
++pub const SLASH: [&str; 10] = [
++    "#......",
++    ".#.....",
++    "..#....",
++    "...#...",
++    "....#..",
++    ".....#.",
++    "......#",
++    ".......",
++    ".......",
++    ".......",
++];
++pub const SPEAKER: [&str; 8] = [
++    "....#....",
++    "...##..#.",
++    "####.#..#",
++    "####..#.#",
++    "####..#.#",
++    "####.#..#",
++    "...##..#.",
++    "....#....",
++];
++pub const HEADSET: [&str; 9] = [
++    "..#####..",
++    ".#.....#.",
++    "#.......#",
++    "#.......#",
++    "##.....##",
++    "##.....##",
++    "##.....##",
++    "##.....##",
++    ".........",
++];
++pub const GROUP: [&str; 7] = [
++    ".##.##...",
++    "####.###.",
++    ".##.##.##",
++    "...#.#...",
++    ".#######.",
++    ".#######.",
++    ".........",
++];
++
++/// The three bars of a talking voice, `phase` in seconds: each bar's height
++/// from 1 to 7 pixels, moving like a level meter.
++pub fn wave_heights(phase: f32, seed: u32) -> [f32; 3] {
++    let mut out = [0.0; 3];
++    for (i, h) in out.iter_mut().enumerate() {
++        let t = phase * (7.0 + i as f32 * 2.3) + (seed % 17) as f32 + i as f32 * 1.7;
++        *h = (3.5 + 2.8 * t.sin() + 0.7 * (t * 2.1).cos()).clamp(1.0, 7.0).round();
++    }
++    out
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn a_head_is_eight_rows_and_the_hat_wins() {
++        let mut face = [[0x112233; 8]; 8];
++        let mut hat = [[0; 8]; 8];
++        hat[0][3] = 0xFF0000;
++        face[7][0] = 0x00FF00;
++        let rects = head_rects(Some(&(face, hat)), "x");
++        assert!(rects.iter().any(|(r, c)| r[1] == 0.0 && r[0] == 3.0 && *c == 0xFFFF0000));
++        let area: f32 = rects.iter().map(|(r, _)| r[2] * r[3]).sum();
++        assert_eq!(area, 64.0);
++    }
++
++    #[test]
++    fn a_name_without_a_skin_keeps_its_own_face() {
++        assert_eq!(default_face("Alex"), default_face("Alex"));
++        assert_ne!(default_face("Alex"), default_face("Bea Z"));
++        assert_eq!(icon_rects(&MIC, 0xFFFFFF).iter().map(|(r, _)| r[2]).sum::<f32>() as usize, MIC.iter().map(|r| r.matches('#').count()).sum());
++    }
++}
+diff --git a/native-mods/voicechat/mixins/voicechat/engine/src/net.rs b/native-mods/voicechat/mixins/voicechat/engine/src/net.rs
+index 019c976..4bcf85d 100644
+--- a/native-mods/voicechat/mixins/voicechat/engine/src/net.rs
++++ b/native-mods/voicechat/mixins/voicechat/engine/src/net.rs
+@@ -31,6 +31,10 @@ pub struct Controls {
+     pub whisper: bool,
+     pub muted: bool,
+     pub disabled: bool,
++    /// Hear nobody (the microphone stays as it is).
++    pub deafened: bool,
++    /// Play the microphone back, to test it (not stored).
++    pub loopback: bool,
+     pub threshold_db: f32,
+     pub mic_gain: f32,
+     pub volume: f32,
+@@ -45,6 +49,8 @@ impl Default for Controls {
+             whisper: false,
+             muted: false,
+             disabled: false,
++            deafened: false,
++            loopback: false,
+             threshold_db: -50.0,
+             mic_gain: 1.0,
+             volume: 1.0,
+@@ -167,11 +173,17 @@ fn run(
+     // The mic thread stops with this one, whatever ends it.
+     let quit = Arc::new(AtomicBool::new(false));
+     let mic_thread = {
+-        let (socket, link, shared, connected, quit) =
+-            (socket.try_clone().map_err(|e| e.to_string())?, link.clone(), shared.clone(), connected.clone(), quit.clone());
++        let (socket, link, shared, connected, quit, mixer) = (
++            socket.try_clone().map_err(|e| e.to_string())?,
++            link.clone(),
++            shared.clone(),
++            connected.clone(),
++            quit.clone(),
++            mixer.clone(),
++        );
+         std::thread::Builder::new()
+             .name("voicechat-mic".into())
+-            .spawn(move || mic_loop(&socket, &link, &shared, &mic, &quit, &connected))
++            .spawn(move || mic_loop(&socket, &link, &shared, &mic, &quit, &connected, &mixer))
+             .ok()
+     };
+ 
+@@ -294,7 +306,7 @@ fn play(s: Sound, own: u128, shared: &Shared, mixer: &Mutex<Mixer>, channels: &m
+ 
+     let (volume, listener) = {
+         let c = shared.controls.lock().unwrap();
+-        let v = c.volume * c.player_volumes.get(&s.sender).copied().unwrap_or(1.0);
++        let v = if c.deafened { 0.0 } else { c.volume * c.player_volumes.get(&s.sender).copied().unwrap_or(1.0) };
+         (v, *shared.listener.lock().unwrap())
+     };
+     let gain = match s.kind {
+@@ -321,7 +333,18 @@ fn play(s: Sound, own: u128, shared: &Shared, mixer: &Mutex<Mixer>, channels: &m
+ 
+ /// `MicThread`: each 20 ms frame of the microphone, sent while the push to
+ /// talk key is held or the voice is loud enough, and a little after.
+-fn mic_loop(socket: &UdpSocket, link: &Link, shared: &Shared, mic: &MicQueue, stop: &AtomicBool, connected: &AtomicBool) {
++/// The channel the microphone test plays on (no player has this id).
++pub const LOOPBACK: u128 = u128::MAX;
++
++fn mic_loop(
++    socket: &UdpSocket,
++    link: &Link,
++    shared: &Shared,
++    mic: &MicQueue,
++    stop: &AtomicBool,
++    connected: &AtomicBool,
++    mixer: &Mutex<Mixer>,
++) {
+     let mut encoder = match Encoder::new(link.secret.opus_application(), link.secret.mtu) {
+         Ok(e) => e,
+         Err(e) => {
+@@ -383,5 +406,13 @@ fn mic_loop(socket: &UdpSocket, link: &Link, shared: &Shared, mic: &MicQueue, st
+             hold = 0;
+         }
+         shared.transmitting.store(sending, Ordering::Relaxed);
++        // The microphone test: what would be sent plays back at once.
++        let mut m = mixer.lock().unwrap();
++        if c.loopback && talk {
++            let pcm = pcm.iter().map(|s| f32::from(*s) / 32768.0).collect();
++            m.push(LOOPBACK, Frame { pcm, gain: [c.volume.min(1.0); 2] });
++        } else {
++            m.end(LOOPBACK);
++        }
+     }
+ }
+diff --git a/native-mods/voicechat/mixins/voicechat/engine/src/opus.rs b/native-mods/voicechat/mixins/voicechat/engine/src/opus.rs
+index 09a645a..a358081 100644
+--- a/native-mods/voicechat/mixins/voicechat/engine/src/opus.rs
++++ b/native-mods/voicechat/mixins/voicechat/engine/src/opus.rs
+@@ -12,6 +12,10 @@ pub const APPLICATION_VOIP: i32 = 2048;
+ pub const APPLICATION_AUDIO: i32 = 2049;
+ pub const APPLICATION_RESTRICTED_LOWDELAY: i32 = 2051;
+ const OPUS_RESET_STATE: c_int = 4028;
++const OPUS_SET_COMPLEXITY: c_int = 4010;
++/// 0 to 10, 9 by default: speech sounds the same at 3 for a fraction of the
++/// work, which a phone's weak cores feel.
++const COMPLEXITY: c_int = 3;
+ 
+ type EncoderCreate = unsafe extern "C" fn(i32, c_int, c_int, *mut c_int) -> *mut c_void;
+ type Encode = unsafe extern "C" fn(*mut c_void, *const i16, c_int, *mut u8, i32) -> i32;
+@@ -134,6 +138,7 @@ impl Encoder {
+         if raw.is_null() || err != 0 {
+             return Err(format!("opus_encoder_create failed ({err})"));
+         }
++        unsafe { (api.encoder_ctl)(raw, OPUS_SET_COMPLEXITY, COMPLEXITY) };
+         Ok(Self { api, raw, max_bytes: max_bytes.clamp(64, 1275) })
+     }
+ 
+diff --git a/native-mods/voicechat/mixins/voicechat/engine/src/ui.rs b/native-mods/voicechat/mixins/voicechat/engine/src/ui.rs
+index e179072..34e6536 100644
+--- a/native-mods/voicechat/mixins/voicechat/engine/src/ui.rs
++++ b/native-mods/voicechat/mixins/voicechat/engine/src/ui.rs
+@@ -2,6 +2,7 @@
+ //! groups, on the mod's own screen. It lays itself out from a [`View`] of the
+ //! voice chat each frame and keeps only what is typed and focused.
+ use crate::Settings;
++use crate::look::{self, Rect};
+ use crate::net::Mode;
+ 
+ /// What a hook draws, in GUI pixels: a filled `[x, y, w, h]` in ARGB, or a
+@@ -18,6 +19,15 @@ pub enum Action {
+     Disable,
+     Mode,
+     Labels,
++    Hud,
++    Deafen,
++    Loopback,
++    /// Step one player's volume by this many percent.
++    PlayerStep(u128, i32),
++    PlayerMute(u128),
++    Tab(Tab),
++    /// A slider bar clicked at a fraction (0..1) of its width.
++    Slide(Slider, f32),
+     Volume(i32),
+     Gain(i32),
+     Threshold(i32),
+@@ -32,6 +42,22 @@ pub enum Action {
+     Close,
+ }
+ 
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
++pub enum Tab {
++    #[default]
++    Voice,
++    Players,
++    Groups,
++    More,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Slider {
++    Volume,
++    Gain,
++    Threshold,
++}
++
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub enum Field {
+     Name,
+@@ -49,6 +75,25 @@ pub struct GroupRow {
+     pub ours: bool,
+ }
+ 
++/// A player with voice chat as the menu lists them.
++#[derive(Clone, Debug, PartialEq)]
++pub struct PlayerRow {
++    pub id: u128,
++    pub name: String,
++    /// The face, as [`look::head_rects`] gives it.
++    pub head: Vec<Rect>,
++    pub talking: bool,
++    pub whisper: bool,
++    pub mic_muted: bool,
++    pub voice_off: bool,
++    pub in_group: bool,
++    /// Blocks away, when the player is in this world's reach.
++    pub distance: Option<f32>,
++    /// What this player's voice is set to, in percent, and whether it is muted.
++    pub volume: u32,
++    pub muted: bool,
++}
++
+ /// The voice chat as the menu shows it this frame.
+ pub struct View {
+     pub status: (String, u32),
+@@ -57,6 +102,8 @@ pub struct View {
+     pub connected: bool,
+     pub groups_enabled: bool,
+     pub groups: Vec<GroupRow>,
++    pub players: Vec<PlayerRow>,
++    pub loopback: bool,
+     /// The hotkeys: what each does and the key bound to it, already named.
+     pub hotkeys: Vec<(String, String)>,
+ }
+@@ -67,24 +114,35 @@ pub struct Widget {
+     pub action: Action,
+ }
+ 
+-const PANEL: u32 = 0xE010_1018;
+-const PANEL_EDGE: u32 = 0xFF50_5060;
+-const BUTTON: u32 = 0xFF30_3038;
+-const BUTTON_HOVER: u32 = 0xFF40_4058;
+-const BUTTON_ON: u32 = 0xFF2E_5E2E;
+-const BUTTON_OFF: u32 = 0xFF6A_2A2A;
+-const FIELD: u32 = 0xFF00_0000;
+-const FOCUS: u32 = 0xFFFF_FFFF;
+-const INK: u32 = 0xFF_FFFF;
+-const GREY: u32 = 0xAA_AAAA;
+-const DARK: u32 = 0x77_7777;
+-const GOLD: u32 = 0xFF_CC55;
+-const GREEN: u32 = 0x55_FF55;
+-const RED: u32 = 0xFF_5555;
++// Minecraft's own look: the inventory's light grey panel with its bevel,
++// grey buttons, black fields and lists.
++const BLACK: u32 = 0xFF00_0000;
++const WHITE: u32 = 0xFFFF_FFFF;
++const PANEL: u32 = 0xFFC6_C6C6;
++const PANEL_LIGHT: u32 = 0xFFFF_FFFF;
++const PANEL_SHADE: u32 = 0xFF55_5555;
++const BUTTON_FACE: u32 = 0xFF6F_6F6F;
++const BUTTON_LIGHT: u32 = 0xFFA5_A5A5;
++const BUTTON_SHADE: u32 = 0xFF3A_3A3A;
++const TAB_OFF: u32 = 0xFF8B_8B8B;
++const FIELD_EDGE: u32 = 0xFFA0_A0A0;
++const LIST_BG: u32 = 0xFF10_1010;
++const INK: u32 = 0x40_4040;
++const LABEL: u32 = 0x55_5555;
++const HINT: u32 = 0x80_8080;
++const LIST_GREY: u32 = 0xAA_AAAA;
++const ON: u32 = 0x55_FF55;
++const OFF: u32 = 0xFF_5555;
++const HOVER_TEXT: u32 = 0xFF_FFA0;
++
++// The colours the engine gives its status lines (for the HUD's dark ground).
++const GREEN: u32 = 0x55FF55;
++const RED: u32 = 0xFF5555;
++const YELLOW: u32 = 0xFFFF55;
+ 
+ pub const NAME_MAX: usize = 24;
+ const PASSWORD_MAX: usize = 24;
+-const ROW: f32 = 24.0;
++const ROW: f32 = 22.0;
+ 
+ #[derive(Default)]
+ pub struct Menu {
+@@ -93,6 +151,7 @@ pub struct Menu {
+     pub name: String,
+     pub password: String,
+     pub kind: i16,
++    pub tab: Tab,
+     pub focus: Option<Field>,
+     /// The password group being joined, and what is typed for it.
+     pub joining: Option<u128>,
+@@ -119,17 +178,17 @@ impl Out<'_> {
+     fn fill(&mut self, rect: [f32; 4], argb: u32) {
+         self.draws.push(Draw::Fill(rect, argb));
+     }
++    /// Text with the game's shadow (on dark parts).
+     fn text(&mut self, text: &str, at: [f32; 2], rgb: u32) {
+         self.draws.push(Draw::Text(text.to_owned(), at, rgb, true));
+     }
++    /// Text without a shadow (on the light panel).
++    fn ink(&mut self, text: &str, at: [f32; 2], rgb: u32) {
++        self.draws.push(Draw::Text(text.to_owned(), at, rgb, false));
++    }
+     fn width(&self, text: &str) -> f32 {
+         (self.measure)(text)
+     }
+-    fn boxed(&mut self, rect: [f32; 4], edge: u32, inner: u32) {
+-        let [x, y, w, h] = rect;
+-        self.fill(rect, edge);
+-        self.fill([x + 1.0, y + 1.0, w - 2.0, h - 2.0], inner);
+-    }
+     /// `text` cut to `max` pixels with an ellipsis.
+     fn fit(&self, text: &str, max: f32) -> String {
+         if self.width(text) <= max {
+@@ -141,47 +200,84 @@ impl Out<'_> {
+         }
+         format!("{cut}...")
+     }
+-    /// A button; `state` colours it: Some(true) on, Some(false) off.
++    /// Pixel art: each `#` of `rows` is one GUI pixel.
++    fn icon(&mut self, x: f32, y: f32, rows: &[&str], rgb: u32) {
++        for (r, argb) in look::icon_rects(rows, rgb) {
++            self.fill([x + r[0], y + r[1], r[2], r[3]], argb);
++        }
++    }
++    /// The inventory's panel: black edge, white light, dark shade.
++    fn panel(&mut self, [x, y, w, h]: [f32; 4]) {
++        self.fill([x, y, w, h], BLACK);
++        self.fill([x + 1.0, y + 1.0, w - 2.0, h - 2.0], PANEL_SHADE);
++        self.fill([x + 1.0, y + 1.0, w - 3.0, h - 3.0], PANEL_LIGHT);
++        self.fill([x + 2.0, y + 2.0, w - 4.0, h - 4.0], PANEL);
++    }
++    /// A sunken part: the shade up and left, the light down and right.
++    fn sunken(&mut self, [x, y, w, h]: [f32; 4], inner: u32) {
++        self.fill([x, y, w, h], PANEL_LIGHT);
++        self.fill([x, y, w - 1.0, h - 1.0], PANEL_SHADE);
++        self.fill([x + 1.0, y + 1.0, w - 2.0, h - 2.0], inner);
++    }
++    /// A grey Minecraft button face, white-edged while the pointer is on it.
++    fn face(&mut self, [x, y, w, h]: [f32; 4], hover: bool, pressed: bool) {
++        self.fill([x, y, w, h], if hover { WHITE } else { BLACK });
++        let (light, shade) = if pressed { (BUTTON_SHADE, BUTTON_LIGHT) } else { (BUTTON_LIGHT, BUTTON_SHADE) };
++        self.fill([x + 1.0, y + 1.0, w - 2.0, h - 2.0], shade);
++        self.fill([x + 1.0, y + 1.0, w - 3.0, h - 3.0], light);
++        self.fill([x + 2.0, y + 2.0, w - 4.0, h - 4.0], BUTTON_FACE);
++    }
++    /// A button; `state` colours its words: Some(true) green, Some(false) red.
+     fn button(&mut self, rect: [f32; 4], label: &str, action: Action, state: Option<bool>) {
+         let hover = inside(rect, self.mouse);
+-        let fill = match state {
+-            _ if hover => BUTTON_HOVER,
+-            Some(true) => BUTTON_ON,
+-            Some(false) => BUTTON_OFF,
+-            None => BUTTON,
+-        };
+-        self.boxed(rect, if hover { FOCUS } else { PANEL_EDGE }, fill);
+-        let label = self.fit(label, rect[2] - 4.0);
++        self.face(rect, hover, false);
++        let label = self.fit(label, rect[2] - 6.0);
+         let w = self.width(&label);
+-        self.text(&label, [rect[0] + (rect[2] - w) / 2.0, rect[1] + (rect[3] - 8.0) / 2.0], INK);
++        let rgb = match state {
++            _ if hover => HOVER_TEXT,
++            Some(true) => ON,
++            Some(false) => OFF,
++            None => WHITE & 0xFF_FFFF,
++        };
++        self.text(&label, [rect[0] + (rect[2] - w) / 2.0, rect[1] + (rect[3] - 8.0) / 2.0], rgb);
+         self.widgets.push(Widget { rect, action });
+     }
+-    /// A text field showing `value` (dots for a password), focused or not.
++    /// A text field showing `value` (stars for a password), focused or not.
+     fn field(&mut self, rect: [f32; 4], value: &str, hint: &str, secret: bool, focus: bool, action: Action) {
+-        self.boxed(rect, if focus { FOCUS } else { PANEL_EDGE }, FIELD);
++        self.fill(rect, if focus { WHITE } else { FIELD_EDGE });
++        self.fill([rect[0] + 1.0, rect[1] + 1.0, rect[2] - 2.0, rect[3] - 2.0], BLACK);
+         let shown = if secret { "*".repeat(value.chars().count()) } else { value.to_owned() };
+-        let (text, rgb) = if shown.is_empty() && !focus { (hint.to_owned(), DARK) } else { (shown, INK) };
+-        let mut text = text;
++        let (mut text, rgb) = if shown.is_empty() && !focus { (hint.to_owned(), HINT) } else { (shown, WHITE & 0xFF_FFFF) };
+         while !text.is_empty() && self.width(&text) > rect[2] - 10.0 {
+             text.remove(0);
+         }
+         let caret = if focus { "_" } else { "" };
+-        self.text(&format!("{text}{caret}"), [rect[0] + 3.0, rect[1] + 2.0], rgb);
++        self.text(&format!("{text}{caret}"), [rect[0] + 3.0, rect[1] + (rect[3] - 8.0) / 2.0], rgb);
+         self.widgets.push(Widget { rect, action });
+     }
+-    /// `label: [-] value [+]` across `w`.
+-    fn stepper(&mut self, x: f32, y: f32, w: f32, label: &str, value: &str, down: Action, up: Action) {
+-        self.text(label, [x, y + 2.0], GREY);
+-        let right = x + w;
+-        self.button([right - 12.0, y, 12.0, 12.0], "+", up, None);
+-        let vw = 44.0;
+-        let vx = right - 14.0 - vw;
+-        let tw = self.width(value);
+-        self.text(value, [vx + (vw - tw) / 2.0, y + 2.0], INK);
+-        self.button([vx - 14.0, y, 12.0, 12.0], "-", down, None);
++    /// `label  [-] [ track with a handle, the value on it ] [+]`: the track
++    /// sets the value where it is clicked, the buttons step it.
++    fn slider(&mut self, x: f32, y: f32, w: f32, label: &str, slider: Slider, fraction: f32, value: &str, down: Action, up: Action) {
++        let lw = (w * 0.34).min(100.0);
++        let label = self.fit(label, lw - 4.0);
++        self.ink(&label, [x, y + 5.0], INK);
++        self.button([x + lw, y, 16.0, 16.0], "-", down, None);
++        self.button([x + w - 16.0, y, 16.0, 16.0], "+", up, None);
++        let bar = [x + lw + 18.0, y, w - lw - 36.0, 16.0];
++        let hover = inside(bar, self.mouse);
++        self.fill(bar, if hover { WHITE } else { BLACK });
++        self.fill([bar[0] + 1.0, bar[1] + 1.0, bar[2] - 2.0, bar[3] - 2.0], 0xFF20_2020);
++        let handle = 8.0;
++        let at = bar[0] + 1.0 + fraction.clamp(0.0, 1.0) * (bar[2] - 2.0 - handle);
++        self.face([at, bar[1] + 1.0, handle, bar[3] - 2.0], hover, false);
++        let vw = self.width(value);
++        self.text(value, [bar[0] + (bar[2] - vw) / 2.0, bar[1] + 4.0], WHITE & 0xFF_FFFF);
++        self.widgets.push(Widget { rect: bar, action: Action::Slide(slider, 0.0) });
+     }
+ }
+ 
++const PLAYER_ROW: f32 = 24.0;
++
+ pub const KINDS: [&str; 3] = ["Normal", "Open", "Isolated"];
+ 
+ impl Menu {
+@@ -219,7 +315,10 @@ impl Menu {
+ 
+     /// The action under the pointer, from the last frame drawn.
+     pub fn hit(&self, at: [f32; 2]) -> Option<Action> {
+-        self.widgets.iter().rev().find(|w| inside(w.rect, at)).map(|w| w.action.clone())
++        self.widgets.iter().rev().find(|w| inside(w.rect, at)).map(|w| match &w.action {
++            Action::Slide(slider, _) => Action::Slide(*slider, ((at[0] - w.rect[0]) / w.rect[2]).clamp(0.0, 1.0)),
++            other => other.clone(),
++        })
+     }
+ 
+     /// Where the widget doing `action` was drawn last.
+@@ -301,128 +400,286 @@ impl Menu {
+ 
+     pub fn draw(&mut self, view: &View, size: [f32; 2], mouse: [f32; 2], measure: &dyn Fn(&str) -> f32) -> Vec<Draw> {
+         let mut out = Out { draws: Vec::new(), widgets: Vec::new(), mouse, measure };
+-        let w = (size[0] - 16.0).min(440.0);
+-        let h = (size[1] - 16.0).min(260.0);
++        let w = (size[0] - 12.0).min(380.0);
++        let h = (size[1] - 12.0).min(232.0);
+         let (x0, y0) = ((size[0] - w) / 2.0, (size[1] - h) / 2.0);
+-        out.fill([0.0, 0.0, size[0], size[1]], 0x8000_0000);
+-        out.boxed([x0, y0, w, h], PANEL_EDGE, PANEL);
+-        out.text("Voice Chat", [x0 + 6.0, y0 + 5.0], GOLD);
+-        out.button([x0 + w - 16.0, y0 + 3.0, 12.0, 12.0], "x", Action::Close, None);
++        out.fill([0.0, 0.0, size[0], size[1]], 0xA000_0000);
++        out.panel([x0, y0, w, h]);
++        out.icon(x0 + 8.0, y0 + 7.0, &look::SPEAKER, INK);
++        out.ink("Voice Chat", [x0 + 21.0, y0 + 7.0], INK);
++        // What the connection is doing, in the game's own colours.
+         let (status, rgb) = &view.status;
+-        let tw = out.width("Voice Chat") + 12.0;
+-        let st = out.fit(status, w - tw - 24.0);
+-        out.text(&st, [x0 + tw, y0 + 5.0], *rgb);
+-
+-        let col = (w - 18.0) / 2.0;
+-        let (lx, rx, top) = (x0 + 6.0, x0 + 12.0 + col, y0 + 20.0);
+-        out.fill([x0 + 9.0 + col, top, 1.0, h - 26.0], PANEL_EDGE);
+-        self.draw_controls(&mut out, view, lx, top, col);
+-        self.draw_groups(&mut out, view, rx, top, col, y0 + h - 6.0);
++        let rgb = match *rgb {
++            GREEN => 0x00_8A00,
++            RED => 0xAA_0000,
++            YELLOW => 0x9A_6A00,
++            _ => LABEL,
++        };
++        let tw = out.width("Voice Chat") + 29.0;
++        let st = out.fit(status, w - tw - 42.0);
++        let sw = out.width(&st);
++        out.ink(&st, [x0 + w - 26.0 - sw, y0 + 7.0], rgb);
++        out.fill([x0 + w - 36.0 - sw, y0 + 8.0, 6.0, 6.0], BLACK);
++        out.fill([x0 + w - 35.0 - sw, y0 + 9.0, 4.0, 4.0], 0xFF00_0000 | rgb);
++        out.button([x0 + w - 22.0, y0 + 5.0, 16.0, 14.0], "x", Action::Close, None);
++        // Tabs, the open one joined to the panel.
++        let tabs = [(Tab::Voice, "Voice"), (Tab::Players, "Players"), (Tab::Groups, "Groups"), (Tab::More, "More")];
++        let tab_w = (w - 16.0) / 4.0;
++        let ty = y0 + 22.0;
++        out.fill([x0 + 8.0, ty + 15.0, w - 16.0, 1.0], PANEL_SHADE);
++        for (i, (tab, label)) in tabs.iter().enumerate() {
++            let rect = [x0 + 8.0 + tab_w * i as f32, ty, tab_w - 1.0, 16.0];
++            let on = self.tab == *tab;
++            let hover = inside(rect, mouse);
++            out.fill(rect, if hover && !on { WHITE } else { BLACK });
++            out.fill([rect[0] + 1.0, rect[1] + 1.0, rect[2] - 2.0, rect[3] - 1.0], if on { PANEL } else { TAB_OFF });
++            if on {
++                out.fill([rect[0] + 1.0, rect[1] + 1.0, rect[2] - 2.0, 1.0], PANEL_LIGHT);
++                out.fill([rect[0] + 1.0, rect[1] + rect[3] - 1.0, rect[2] - 2.0, 2.0], PANEL);
++            }
++            let lw = out.width(label);
++            out.ink(label, [rect[0] + (rect[2] - lw) / 2.0, rect[1] + 5.0], if on { INK } else { LABEL });
++            out.widgets.push(Widget { rect, action: Action::Tab(*tab) });
++        }
++        let (x, top, cw) = (x0 + 8.0, y0 + 44.0, w - 16.0);
++        let bottom = y0 + h - 15.0;
++        match self.tab {
++            Tab::Voice => self.draw_voice(&mut out, view, x, top, cw),
++            Tab::Players => self.draw_players(&mut out, view, x, top, cw, bottom),
++            Tab::Groups => self.draw_groups(&mut out, view, x, top, cw, bottom),
++            Tab::More => self.draw_more(&mut out, view, x, top, cw),
++        }
++        // Footer: the last thing that happened.
++        if let Some((m, rgb)) = &self.message {
++            let rgb = if *rgb == RED { 0xAA_0000 } else { 0x00_8A00 };
++            out.ink(&out.fit(m, w - 16.0), [x, y0 + h - 13.0], rgb);
++        } else {
++            out.ink(&out.fit("Press Esc or V to close", w - 16.0), [x, y0 + h - 13.0], HINT);
++        }
+         self.widgets = out.widgets;
+         out.draws
+     }
+ 
+-    fn draw_controls(&self, out: &mut Out<'_>, view: &View, x: f32, top: f32, w: f32) {
++    fn draw_voice(&self, out: &mut Out<'_>, view: &View, x: f32, top: f32, w: f32) {
+         let s = &view.settings;
++        let third = (w - 8.0) / 3.0;
+         let mut y = top;
+-        let toggle = |out: &mut Out<'_>, y: &mut f32, label: String, action, on| {
+-            out.button([x, *y, w, 12.0], &label, action, Some(on));
+-            *y += 14.0;
++        out.button(
++            [x, y, third, 18.0],
++            &format!("Mic: {}", if s.muted { "Off" } else { "On" }),
++            Action::Mute,
++            Some(!s.muted),
++        );
++        out.button(
++            [x + third + 4.0, y, third, 18.0],
++            &format!("Hear: {}", if s.deafened { "Off" } else { "On" }),
++            Action::Deafen,
++            Some(!s.deafened),
++        );
++        out.button(
++            [x + 2.0 * (third + 4.0), y, third, 18.0],
++            &format!("Voice: {}", if s.disabled { "Off" } else { "On" }),
++            Action::Disable,
++            Some(!s.disabled),
++        );
++        y += 21.0;
++        let auto = s.mode == Mode::Voice;
++        out.button(
++            [x, y, w, 18.0],
++            &format!("Mode: {}", if auto { "Voice activation" } else { "Push to talk" }),
++            Action::Mode,
++            None,
++        );
++        y += 21.0;
++        let hint = if auto {
++            "The mic opens by itself when you talk".to_owned()
++        } else {
++            let key = view.hotkeys.get(1).map_or("the talk key", |h| h.1.as_str());
++            format!("Hold {key} to talk")
+         };
+-        toggle(out, &mut y, format!("Microphone: {}", if s.muted { "Muted" } else { "On" }), Action::Mute, !s.muted);
+-        toggle(out, &mut y, format!("Voice chat: {}", if s.disabled { "Off" } else { "On" }), Action::Disable, !s.disabled);
+-        let mode = if s.mode == Mode::Voice { "Voice activation" } else { "Push to talk" };
+-        out.button([x, y, w, 12.0], &format!("Activation: {mode}"), Action::Mode, None);
+-        y += 14.0;
+-        toggle(out, &mut y, format!("Group names above players: {}", if s.group_labels { "On" } else { "Off" }), Action::Labels, s.group_labels);
+-        y += 2.0;
+-        out.stepper(x, y, w, "Voice volume", &format!("{}%", s.volume), Action::Volume(-25), Action::Volume(25));
+-        y += 14.0;
+-        out.stepper(x, y, w, "Microphone gain", &format!("{}%", s.mic_gain), Action::Gain(-25), Action::Gain(25));
+-        y += 14.0;
+-        out.stepper(x, y, w, "Activation level", &format!("{} dB", s.threshold), Action::Threshold(-5), Action::Threshold(5));
+-        y += 14.0;
+-        // The microphone's level against the activation level, -80 to 0 dB.
+-        let bar = [x, y, w, 5.0];
+-        out.fill(bar, 0xFF00_0000);
+-        let at = |db: f32| ((db + 80.0) / 80.0).clamp(0.0, 1.0) * (w - 2.0);
+-        let loud = view.level_db > s.threshold as f32;
+-        out.fill([x + 1.0, y + 1.0, at(view.level_db), 3.0], if loud { 0xFF55_FF55 } else { 0xFF55_7755 });
+-        out.fill([x + 1.0 + at(s.threshold as f32), y, 1.0, 5.0], 0xFFFF_CC55);
+-        y += 10.0;
+-
+-        out.text("Hotkeys", [x, y], GOLD);
++        out.ink(&out.fit(&hint, w), [x, y], LABEL);
++        y += 12.0;
++        out.slider(x, y, w, "Voice volume", Slider::Volume, s.volume as f32 / 200.0, &format!("{}%", s.volume), Action::Volume(-10), Action::Volume(10));
++        y += 18.0;
++        out.slider(x, y, w, "Mic gain", Slider::Gain, (s.mic_gain as f32 - 25.0) / 475.0, &format!("{}%", s.mic_gain), Action::Gain(-10), Action::Gain(10));
++        y += 18.0;
++        if auto {
++            out.slider(x, y, w, "Mic threshold", Slider::Threshold, (s.threshold as f32 + 80.0) / 80.0, &format!("{} dB", s.threshold), Action::Threshold(-2), Action::Threshold(2));
++            y += 18.0;
++        }
++        // The microphone's level, with the activation level marked on it.
++        let lw = (w * 0.34).min(100.0);
++        out.button([x, y - 2.0, lw, 13.0], "Mic test", Action::Loopback, Some(view.loopback).filter(|on| *on));
++        let bar = [x + lw + 18.0, y, w - lw - 18.0, 9.0];
++        out.sunken(bar, BLACK);
++        let inner = bar[2] - 2.0;
++        let at = |db: f32| ((db + 80.0) / 80.0).clamp(0.0, 1.0);
++        let lit = at(view.level_db);
++        let segments = ((inner / 4.0) as usize).max(10);
++        let seg_w = inner / segments as f32;
++        for i in 0..segments {
++            let f = (i as f32 + 0.5) / segments as f32;
++            if f > lit {
++                break;
++            }
++            let rgb = if f < 0.6 { 0xFF55_FF55 } else if f < 0.85 { 0xFFFF_FF55 } else { 0xFFFF_5555 };
++            let on = auto && view.level_db <= s.threshold as f32;
++            out.fill([bar[0] + 1.0 + seg_w * i as f32, bar[1] + 1.0, (seg_w - 1.0).max(1.0), 7.0], if on { 0xFF6A_7A6A } else { rgb });
++        }
++        if auto {
++            out.fill([bar[0] + 1.0 + at(s.threshold as f32) * inner, bar[1], 1.0, 9.0], WHITE);
++        }
++    }
++
++    fn draw_more(&self, out: &mut Out<'_>, view: &View, x: f32, top: f32, w: f32) {
++        let s = &view.settings;
++        let mut y = top;
++        out.button(
++            [x, y, w, 18.0],
++            &format!("Tags above players: {}", if s.group_labels { "Shown" } else { "Hidden" }),
++            Action::Labels,
++            Some(s.group_labels),
++        );
++        y += 21.0;
++        out.button(
++            [x, y, w, 18.0],
++            &format!("Corner display: {}", if s.hud { "Shown" } else { "Hidden" }),
++            Action::Hud,
++            Some(s.hud),
++        );
++        y += 24.0;
++        out.ink("Hotkeys", [x, y], INK);
+         y += 11.0;
++        let rows = view.hotkeys.len() as f32;
++        out.sunken([x, y, w, rows * 12.0 + 4.0], LIST_BG);
++        y += 3.0;
+         for (what, key) in &view.hotkeys {
+-            out.text(&out.fit(what, w * 0.6), [x + 2.0, y], GREY);
++            out.text(&out.fit(what, w * 0.62), [x + 4.0, y + 1.0], LIST_GREY);
+             let kw = out.width(key);
+-            out.text(key, [x + w - kw, y], if key == "not bound" { DARK } else { INK });
+-            y += 10.0;
++            out.text(key, [x + w - kw - 4.0, y + 1.0], if key == "not set" { HINT } else { 0xFF_FFFF });
++            y += 12.0;
+         }
+-        out.text(&out.fit("Change keys in Options > Mods > Horizon Voice Chat", w), [x, y + 1.0], DARK);
+     }
+ 
+-    fn draw_groups(&self, out: &mut Out<'_>, view: &View, x: f32, top: f32, w: f32, bottom: f32) {
++    fn draw_players(&self, out: &mut Out<'_>, view: &View, x: f32, top: f32, w: f32, bottom: f32) {
+         let mut y = top;
+-        out.text("Groups", [x, y + 2.0], GOLD);
+-        if let Some(ours) = view.groups.iter().find(|g| g.ours) {
+-            let label = out.fit(&format!("In {}", ours.name), w - 60.0);
+-            let lw = out.width(&label);
+-            out.text(&label, [x + w - 46.0 - lw, y + 2.0], GREEN);
+-            out.button([x + w - 42.0, y, 42.0, 12.0], "Leave", Action::Leave, None);
++        if !view.connected {
++            out.ink("Voice chat is not connected", [x, y + 2.0], LABEL);
++            return;
++        }
++        out.ink(&format!("Players with voice chat: {}", view.players.len()), [x, y + 2.0], INK);
++        y += 13.0;
++        let list_h = (bottom - y - 1.0).max(PLAYER_ROW);
++        let fits = (((list_h - 2.0) / PLAYER_ROW).floor() as usize).max(1);
++        let scroll = self.scroll.min(view.players.len().saturating_sub(fits));
++        let list_w = if view.players.len() > fits { w - 16.0 } else { w };
++        out.sunken([x, y, list_w, list_h], LIST_BG);
++        if view.players.is_empty() {
++            out.text("No other players with voice chat", [x + 4.0, y + 5.0], LIST_GREY);
+         }
+-        y += 15.0;
+-        // The create form at the bottom, the message above it.
+-        let form_top = bottom - 42.0;
++        let list_top = y;
++        y += 1.0;
++        for p in view.players.iter().skip(scroll).take(fits) {
++            let right = x + list_w - 4.0;
++            // The face: green framed while the player talks.
++            let (hx, hy) = (x + 5.0, y + 4.0);
++            out.fill([hx - 1.0, hy - 1.0, 18.0, 18.0], if p.talking { 0xFF55_FF55 } else { BLACK });
++            for (r, argb) in &p.head {
++                out.fill([hx + r[0] * 2.0, hy + r[1] * 2.0, r[2] * 2.0, r[3] * 2.0], *argb);
++            }
++            let name_w = list_w - 130.0;
++            out.text(&out.fit(&p.name, name_w), [x + 27.0, y + 4.0], 0xFF_FFFF);
++            let (sub, rgb) = if p.talking {
++                (if p.whisper { "Whispering".to_owned() } else { "Talking".to_owned() }, 0x55_FF55)
++            } else if p.voice_off {
++                ("Voice chat off".to_owned(), 0xFF_5555)
++            } else if p.mic_muted {
++                ("Mic muted".to_owned(), 0xFF_5555)
++            } else if let Some(d) = p.distance {
++                (format!("{} m{}", d.round() as i64, if p.in_group { " - your group" } else { "" }), LIST_GREY)
++            } else {
++                (if p.in_group { "Your group".to_owned() } else { "Far away".to_owned() }, LIST_GREY)
++            };
++            out.text(&out.fit(&sub, name_w), [x + 27.0, y + 14.0], rgb);
++            // Volume of this player, and mute: [-] 100% [+] [Bisu].
++            let mute = [right - 34.0, y + 4.0, 34.0, 16.0];
++            out.button(mute, "Mute", Action::PlayerMute(p.id), p.muted.then_some(false));
++            let plus = [mute[0] - 16.0, y + 4.0, 14.0, 16.0];
++            out.button(plus, "+", Action::PlayerStep(p.id, 10), None);
++            let vol_x = plus[0] - 30.0;
++            out.button([vol_x - 14.0, y + 4.0, 14.0, 16.0], "-", Action::PlayerStep(p.id, -10), None);
++            let vol = format!("{}%", if p.muted { 0 } else { p.volume });
++            let vw = out.width(&vol);
++            out.text(&vol, [vol_x + (30.0 - vw) / 2.0, y + 8.0], if p.muted { 0xFF_5555 } else { 0xFF_FFFF });
++            y += PLAYER_ROW;
++        }
++        if view.players.len() > fits {
++            out.button([x + w - 14.0, list_top, 14.0, 14.0], "^", Action::Scroll(-1), None);
++            out.button([x + w - 14.0, list_top + list_h - 14.0, 14.0, 14.0], "v", Action::Scroll(1), None);
++        }
++    }
++
++    fn draw_groups(&self, out: &mut Out<'_>, view: &View, x: f32, top: f32, w: f32, bottom: f32) {
++        let mut y = top;
+         if !view.connected || !view.groups_enabled {
+-            let why = if view.connected { "Groups are off on this server" } else { "Voice chat isn't connected" };
+-            out.text(&out.fit(why, w), [x, y], GREY);
++            let why = if view.connected { "Groups are off on this server" } else { "Voice chat is not connected" };
++            out.ink(&out.fit(why, w), [x, y + 2.0], LABEL);
+             return;
+         }
+-        let list_bottom = form_top - if self.message.is_some() { 12.0 } else { 2.0 };
+-        let fits = (((list_bottom - y) / ROW).floor().max(1.0)) as usize;
++        if let Some(ours) = view.groups.iter().find(|g| g.ours) {
++            let label = out.fit(&format!("Your group: {}", ours.name), w - 56.0);
++            out.ink(&label, [x, y + 3.0], 0x00_8A00);
++            out.button([x + w - 50.0, y, 50.0, 14.0], "Leave", Action::Leave, None);
++        } else {
++            out.ink("Pick a group to join", [x, y + 3.0], LABEL);
++        }
++        y += 17.0;
++        // The create form at the bottom, three rows.
++        let form_top = bottom - 52.0;
++        let list_h = (form_top - 3.0 - y).max(ROW);
++        let fits = ((list_h - 2.0) / ROW).floor().max(1.0) as usize;
+         let scroll = self.scroll.min(view.groups.len().saturating_sub(fits));
++        let list_w = if view.groups.len() > fits { w - 16.0 } else { w };
++        out.sunken([x, y, list_w, list_h], LIST_BG);
+         if view.groups.is_empty() {
+-            out.text("No groups yet: make one below", [x, y], GREY);
++            out.text("No groups yet. Create one below", [x + 4.0, y + 5.0], LIST_GREY);
+         }
++        y += 1.0;
+         for g in view.groups.iter().skip(scroll).take(fits) {
+-            let row = [x, y, w, ROW - 2.0];
+-            out.fill(row, if g.ours { 0x6030_6030 } else { 0x4030_3040 });
++            let row = [x + 1.0, y, list_w - 2.0, ROW];
++            if g.ours {
++                out.fill(row, WHITE);
++                out.fill([row[0] + 1.0, row[1] + 1.0, row[2] - 2.0, row[3] - 2.0], BLACK);
++            }
+             if self.joining == Some(g.id) {
+-                out.text(&out.fit(&format!("Password for {}", g.name), w - 8.0), [x + 3.0, y + 2.0], INK);
+-                let fw = w - 84.0;
+-                out.field([x + 2.0, y + 11.0, fw, 10.0], &self.join_password, "password", true, self.focus == Some(Field::JoinPassword), Action::Focus(Field::JoinPassword));
+-                out.button([x + fw + 4.0, y + 10.0, 36.0, 11.0], "Join", Action::JoinWithPassword, None);
+-                out.button([x + fw + 42.0, y + 10.0, 38.0, 11.0], "Cancel", Action::CancelJoin, None);
++                out.text(&out.fit(&format!("Password for {}", g.name), list_w - 8.0), [x + 4.0, y + 1.0], 0xFF_FFFF);
++                let fw = list_w - 90.0;
++                out.field([x + 3.0, y + 9.0, fw, 12.0], &self.join_password, "password", true, self.focus == Some(Field::JoinPassword), Action::Focus(Field::JoinPassword));
++                out.button([x + fw + 6.0, y + 8.0, 38.0, 13.0], "Join", Action::JoinWithPassword, None);
++                out.button([x + fw + 46.0, y + 8.0, 38.0, 13.0], "Cancel", Action::CancelJoin, None);
+             } else {
+                 let lock = if g.has_password { " (password)" } else { "" };
+-                out.text(&out.fit(&format!("{}{lock}", g.name), w - 50.0), [x + 3.0, y + 2.0], if g.ours { GREEN } else { INK });
+-                let members = if g.members.is_empty() { "nobody".to_owned() } else { g.members.join(", ") };
+-                out.text(&out.fit(&members, w - 50.0), [x + 3.0, y + 12.0], GREY);
++                out.text(&out.fit(&format!("{}{lock}", g.name), list_w - 58.0), [x + 5.0, y + 2.0], 0xFF_FFFF);
++                let members = if g.members.is_empty() { "no members yet".to_owned() } else { g.members.join(", ") };
++                out.text(&out.fit(&members, list_w - 58.0), [x + 5.0, y + 12.0], LIST_GREY);
+                 if !g.ours {
+-                    out.button([x + w - 40.0, y + 5.0, 38.0, 12.0], "Join", Action::Join(g.id), None);
++                    out.button([x + list_w - 48.0, y + 3.0, 44.0, 15.0], "Join", Action::Join(g.id), None);
+                 }
+             }
+             y += ROW;
+         }
+         if view.groups.len() > fits {
+-            let more = format!("{}-{} of {}", scroll + 1, (scroll + fits).min(view.groups.len()), view.groups.len());
+-            out.button([x + w - 22.0, list_bottom - 26.0, 10.0, 12.0], "^", Action::Scroll(-1), None);
+-            out.button([x + w - 11.0, list_bottom - 26.0, 10.0, 12.0], "v", Action::Scroll(1), None);
+-            let mw = out.width(&more);
+-            out.text(&more, [x + w - 26.0 - mw, list_bottom - 24.0], DARK);
+-        }
+-        if let Some((m, rgb)) = &self.message {
+-            out.text(&out.fit(m, w), [x, form_top - 10.0], *rgb);
++            out.button([x + w - 14.0, top + 17.0, 14.0, 14.0], "^", Action::Scroll(-1), None);
++            out.button([x + w - 14.0, top + 17.0 + list_h - 14.0, 14.0, 14.0], "v", Action::Scroll(1), None);
+         }
+-        out.text("New group", [x, form_top + 1.0], GOLD);
+-        let fy = form_top + 11.0;
++        out.ink("Create a group", [x, form_top + 3.0], INK);
++        let fy = form_top + 14.0;
+         let half = (w - 4.0) / 2.0;
+-        out.field([x, fy, half, 12.0], &self.name, "name", false, self.focus == Some(Field::Name), Action::Focus(Field::Name));
+-        out.field([x + half + 4.0, fy, half, 12.0], &self.password, "password (optional)", true, self.focus == Some(Field::Password), Action::Focus(Field::Password));
+-        let by = fy + 15.0;
+-        out.button([x, by, half, 12.0], &format!("Type: {}", KINDS[self.kind as usize % 3]), Action::Kind, None);
+-        out.button([x + half + 4.0, by, half, 12.0], "Create", Action::Create, None);
++        out.field([x, fy, half, 15.0], &self.name, "group name", false, self.focus == Some(Field::Name), Action::Focus(Field::Name));
++        out.field([x + half + 4.0, fy, half, 15.0], &self.password, "password (optional)", true, self.focus == Some(Field::Password), Action::Focus(Field::Password));
++        let by = fy + 18.0;
++        out.button([x, by, half, 16.0], &format!("Type: {}", KINDS[self.kind as usize % 3]), Action::Kind, None);
++        out.button([x + half + 4.0, by, half, 16.0], "Create", Action::Create, None);
+     }
+ 
+     /// What a click on the menu's own parts does; the rest is the voice
+@@ -437,6 +694,11 @@ impl Menu {
+                 self.join_password.clear();
+                 self.focus = None;
+             }
++            Action::Tab(tab) => {
++                self.tab = tab;
++                self.focus = None;
++                self.scroll = 0;
++            }
+             Action::Close => self.close(),
+             other => {
+                 if !matches!(other, Action::JoinWithPassword | Action::Create) {
+@@ -460,15 +722,20 @@ mod tests {
+     fn view() -> View {
+         View {
+             status: ("Connected".into(), 0x55FF55),
+-            settings: Settings::default(),
++            settings: Settings { mode: Mode::Voice, ..Settings::default() },
+             level_db: -30.0,
+             connected: true,
+             groups_enabled: true,
++            players: vec![
++                PlayerRow { id: 7, name: "Alex".into(), head: look::head_rects(None, "Alex"), talking: true, whisper: false, mic_muted: false, voice_off: false, in_group: false, distance: Some(12.0), volume: 100, muted: false },
++                PlayerRow { id: 8, name: "Bea".into(), head: look::head_rects(None, "Bea"), talking: false, whisper: false, mic_muted: true, voice_off: false, in_group: true, distance: None, volume: 150, muted: false },
++            ],
++            loopback: false,
+             groups: vec![
+                 GroupRow { id: 1, name: "Builders".into(), has_password: false, members: vec!["Alex".into()], ours: false },
+                 GroupRow { id: 2, name: "Secret".into(), has_password: true, members: vec![], ours: false },
+             ],
+-            hotkeys: vec![("Push to talk".into(), "Caps Lock".into()), ("Whisper".into(), "not bound".into())],
++            hotkeys: vec![("Open this menu".into(), "V".into()), ("Push to talk".into(), "Caps Lock".into()), ("Whisper".into(), "not set".into())],
+         }
+     }
+ 
+@@ -482,20 +749,45 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn shows_hotkeys_groups_and_members() {
+-        let mut m = Menu::default();
+-        m.open(Some('v'));
++    fn every_tab_fits_and_shows_its_parts() {
+         let measure = |t: &str| t.len() as f32 * 6.0;
+-        let t = texts(&m.draw(&view(), [480.0, 270.0], [0.0, 0.0], &measure));
+-        for want in ["Hotkeys", "Push to talk", "Caps Lock", "not bound", "Builders", "Alex", "Secret (password)"] {
+-            assert!(t.iter().any(|x| x == want), "{want} missing from {t:?}");
++        for size in [[480.0, 270.0], [360.0, 190.0]] {
++            let mut m = Menu::default();
++            m.open(Some('v'));
++            for (tab, wants) in [
++                (Tab::Voice, vec!["Voice volume", "Mic gain", "Mic threshold", "Mic test"]),
++                (Tab::Players, vec!["Players with voice chat: 2", "Alex", "Talking", "Mic muted", "150%"]),
++                (Tab::Groups, vec!["Builders", "Alex", "Secret (password)", "Create a group"]),
++                (Tab::More, vec!["Hotkeys", "Push to talk", "Caps Lock", "not set"]),
++            ] {
++                m.act(Action::Tab(tab));
++                let t = texts(&m.draw(&view(), size, [0.0, 0.0], &measure));
++                for want in wants {
++                    assert!(t.iter().any(|x| x == want), "{want} missing from {t:?}");
++                }
++                assert!(
++                    m.widgets.iter().all(|w| w.rect[0] >= 0.0 && w.rect[1] >= 0.0 && w.rect[0] + w.rect[2] <= size[0] && w.rect[1] + w.rect[3] <= size[1]),
++                    "{tab:?} off screen at {size:?}"
++                );
++            }
+         }
+-        // Every control is on screen.
+-        assert!(m.widgets.iter().all(|w| w.rect[0] >= 0.0 && w.rect[1] + w.rect[3] <= 270.0));
++        let mut m = Menu::default();
++        m.act(Action::Tab(Tab::Groups));
++        m.draw(&view(), [480.0, 270.0], [0.0, 0.0], &measure);
+         let join = centre(&m, &Action::Join(1));
+         assert_eq!(m.hit(join), Some(Action::Join(1)));
+     }
+ 
++    #[test]
++    fn a_slider_click_gives_its_place_on_the_bar() {
++        let mut m = Menu::default();
++        let measure = |t: &str| t.len() as f32 * 6.0;
++        m.draw(&view(), [480.0, 270.0], [0.0, 0.0], &measure);
++        let bar = m.widgets.iter().find(|w| matches!(w.action, Action::Slide(Slider::Volume, _))).unwrap().rect;
++        let Some(Action::Slide(Slider::Volume, f)) = m.hit([bar[0] + bar[2] * 0.75, bar[1] + 2.0]) else { panic!() };
++        assert!((f - 0.75).abs() < 0.01, "{f}");
++    }
++
+     #[test]
+     fn typing_a_new_group_and_creating_it() {
+         let mut m = Menu::default();
+diff --git a/native-mods/voicechat/mixins/voicechat/horizon-mixin.toml b/native-mods/voicechat/mixins/voicechat/horizon-mixin.toml
+index 266ec44..f08b5b0 100644
+--- a/native-mods/voicechat/mixins/voicechat/horizon-mixin.toml
++++ b/native-mods/voicechat/mixins/voicechat/horizon-mixin.toml
+@@ -100,31 +100,6 @@ bindings = [
+   { name = "mods", ty = "&mut Vec<crate::game::native_hooks::NativeMod>", value = "&mut *mods" },
+ ]
+ 
+-[[injection]]
+-id = "settings"
+-hook = "settings"
+-hook_version = 1
+-kind = "HEAD"
+-helper = "settings.rs"
+-bindings = [
+-  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+-  { name = "mod_id", ty = "&str", value = "mod_id" },
+-  { name = "buttons", ty = "&mut Vec<String>", value = "&mut *buttons" },
+-]
+-
+-[[injection]]
+-id = "click"
+-hook = "settings_click"
+-hook_version = 1
+-kind = "HEAD"
+-helper = "click.rs"
+-bindings = [
+-  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+-  { name = "mod_id", ty = "&str", value = "mod_id" },
+-  { name = "button", ty = "usize", value = "button" },
+-]
+-
+-# The voice chat menu (V): the mod's own screen.
+ [[injection]]
+ id = "screen"
+ kind = "HEAD"
+diff --git a/native-mods/voicechat/mixins/voicechat/hud.rs b/native-mods/voicechat/mixins/voicechat/hud.rs
+index c34b170..78fb76c 100644
+--- a/native-mods/voicechat/mixins/voicechat/hud.rs
++++ b/native-mods/voicechat/mixins/voicechat/hud.rs
+@@ -1,6 +1,7 @@
+-// The voice chat's status in the top left corner (connecting, talking,
+-// muted, the group and who is talking), and each player's group above
+-// their head, seen from the camera the world was drawn from.
++// The voice chat in the top left corner: the microphone as an icon with its
++// level, the group, and each player heard now with their face and moving
++// bars; and above each player the group and a talking mark, seen from the
++// camera the world was drawn from.
+ fn voicechat_hud(
+     game: &mut crate::game::Game<'_>,
+     batch: &mut horizon_client::hud::HudBatch,
+@@ -8,26 +9,133 @@ fn voicechat_hud(
+ ) {
+     use horizon_client::extras::Corner;
+     use voicechat_engine as vc;
++    use vc::look;
+     if !game.native_on(vc::ID) {
+         return;
+     }
++    fn paint(
++        game: &crate::game::Game<'_>,
++        batch: &mut horizon_client::hud::HudBatch,
++        rects: Vec<look::Rect>,
++        at: [f32; 2],
++        scale: f32,
++    ) {
++        for (r, argb) in rects {
++            game.native_fill(batch, [at[0] + r[0] * scale, at[1] + r[1] * scale, r[2] * scale, r[3] * scale], argb);
++        }
++    }
+     if let Some((pos, yaw, pitch, fov)) = game.locator_camera {
+         let camera = vc::labels::Camera { pos, yaw, pitch, fov };
+         for label in vc::group_labels(&camera, [batch.width, batch.height]) {
+-            let w = game.native_text_width(&label.text) + 4.0;
+-            let [x, y] = [label.at[0] - w / 2.0, label.at[1] - 6.0];
+-            game.native_fill(batch, [x, y, w, 12.0], 0x6000_0000);
+-            game.native_text(batch, &label.text, [x + 2.0, y + 2.0], label.rgb, true);
++            let icon = if label.speaking.is_some() { 11.0 } else { 0.0 };
++            let text_w = if label.text.is_empty() { 0.0 } else { game.native_text_width(&label.text) };
++            let w = text_w + icon + 4.0;
++            let [x, y] = [label.at[0] - w / 2.0, label.at[1] - 7.0];
++            game.native_fill(batch, [x, y, w, 14.0], 0x6000_0000);
++            if let Some(whisper) = label.speaking {
++                let rgb = if whisper { 0x55FFFF } else { 0x55FF55 };
++                paint(game, batch, look::icon_rects(&look::MIC, rgb), [x + 3.0, y + 2.0], 1.0);
++            }
++            if !label.text.is_empty() {
++                game.native_text(batch, &label.text, [x + 2.0 + icon, y + 3.0], label.rgb, true);
++            }
+         }
+     }
+     if !game.native_corner_shown(Corner::TopLeft) {
+         return;
+     }
+     let ptt = game.native_mod_key(vc::ID, vc::KEY_PTT, vc::DEFAULT_PTT);
+-    for line in vc::hud(&ptt) {
+-        let w = game.native_text_width(&line.text) + 4.0;
+-        let (x, y) = corners.place(Corner::TopLeft, w, 12.0);
+-        game.native_fill(batch, [x, y, w, 12.0], 0x9000_0000);
+-        game.native_text(batch, &line.text, [x + 2.0, y + 2.0], line.rgb, true);
++    let Some(view) = vc::hud_view(&ptt) else { return };
++
++    // Measure the rows first: the block is placed once, then drawn.
++    const PAD: f32 = 5.0;
++    let caption_w = game.native_text_width(&view.caption);
++    let mut width = PAD + 14.0 + 40.0 + caption_w + if view.deafened { 14.0 } else { 0.0 } + PAD;
++    let mut height = 15.0;
++    if let Some((name, count)) = &view.group {
++        width = width.max(PAD + 12.0 + game.native_text_width(&format!("{name} ({count})")) + PAD);
++        height += 12.0;
++    }
++    for p in &view.problems {
++        width = width.max(PAD + game.native_text_width(p) + PAD);
++        height += 11.0;
++    }
++    for s in &view.speakers {
++        let dist = s.distance.map_or(String::new(), |d| format!("{}m", d.round() as i64));
++        width = width.max(PAD + 14.0 + game.native_text_width(&s.name) + 6.0 + 9.0 + 6.0 + game.native_text_width(&dist) + PAD);
++        height += 12.0;
++    }
++    let (x, y) = corners.place(Corner::TopLeft, width, height);
++    game.native_fill(batch, [x, y, width, height], 0x8000_0000);
++    let mic_rgb = match view.mic {
++        vc::MicState::Talking => 0x55FF55,
++        vc::MicState::Whispering => 0x55FFFF,
++        vc::MicState::Idle => 0xFFFFFF,
++        vc::MicState::Muted => 0xFF5555,
++        vc::MicState::Off => 0xAAAAAA,
++        vc::MicState::Waiting => 0xFFFF55,
++    };
++    game.native_fill(batch, [x, y, 2.0, height], 0xFF00_0000 | mic_rgb);
++
++    // The microphone, its level and what it is doing.
++    let mut row = y + 2.0;
++    paint(game, batch, look::icon_rects(&look::MIC, mic_rgb), [x + PAD, row], 1.0);
++    if matches!(view.mic, vc::MicState::Muted | vc::MicState::Off) {
++        paint(game, batch, look::icon_rects(&look::SLASH, 0xFF5555), [x + PAD, row], 1.0);
++    }
++    let lit = if matches!(view.mic, vc::MicState::Muted | vc::MicState::Off) { 0.0 } else { view.level };
++    for i in 0..8 {
++        let f = (i as f32 + 0.5) / 8.0;
++        let rgb = if f > lit {
++            0x3A3A3A
++        } else if f < 0.6 {
++            0x55FF55
++        } else if f < 0.85 {
++            0xFFFF55
++        } else {
++            0xFF5555
++        };
++        game.native_fill(batch, [x + PAD + 11.0 + i as f32 * 5.0, row + 3.0, 4.0, 5.0], 0xFF00_0000 | rgb);
++    }
++    if let Some(t) = view.threshold {
++        game.native_fill(batch, [x + PAD + 11.0 + t * 40.0, row + 1.0, 1.0, 9.0], 0xFFFF_FFFF);
++    }
++    let caption_x = x + PAD + 14.0 + 40.0;
++    game.native_text(batch, &view.caption, [caption_x, row + 1.0], mic_rgb, true);
++    if view.deafened {
++        let hx = caption_x + caption_w + 4.0;
++        paint(game, batch, look::icon_rects(&look::HEADSET, 0xFFAA00), [hx, row + 1.0], 1.0);
++        paint(game, batch, look::icon_rects(&look::SLASH, 0xFF5555), [hx + 1.0, row], 1.0);
++    }
++    row += 13.0;
++    if let Some((name, count)) = &view.group {
++        paint(game, batch, look::icon_rects(&look::GROUP, 0x55FF55), [x + PAD, row + 1.0], 1.0);
++        game.native_text(batch, &format!("{name} ({count})"), [x + PAD + 12.0, row + 1.0], 0x55FF55, true);
++        row += 12.0;
++    }
++    for p in &view.problems {
++        game.native_text(batch, p, [x + PAD, row + 1.0], 0xFF5555, true);
++        row += 11.0;
++    }
++    for s in &view.speakers {
++        let rgb = if s.whisper { 0x55FFFF } else { 0xFFFFFF };
++        game.native_fill(batch, [x + 2.0, row, width - 2.0, 12.0], if s.whisper { 0x3055FFFF } else { 0x3055FF55 });
++        // The face with its hat, one skin pixel a GUI pixel.
++        let head = game.native_player_head(&s.name);
++        game.native_fill(batch, [x + PAD - 1.0, row + 1.0, 10.0, 10.0], 0xFF00_0000);
++        paint(game, batch, look::head_rects(head.as_ref(), &s.name), [x + PAD, row + 2.0], 1.0);
++        let name_w = game.native_text_width(&s.name);
++        game.native_text(batch, &s.name, [x + PAD + 13.0, row + 2.0], rgb, true);
++        // Three bars that move while the voice is heard.
++        let bars_x = x + PAD + 13.0 + name_w + 6.0;
++        for (i, h) in look::wave_heights(view.phase, s.seed).iter().enumerate() {
++            game.native_fill(batch, [bars_x + i as f32 * 3.0, row + 10.0 - h, 2.0, *h], 0xFF00_0000 | if s.whisper { 0x55FFFF } else { 0x55FF55 });
++        }
++        if let Some(d) = s.distance {
++            let text = format!("{}m", d.round() as i64);
++            let w = game.native_text_width(&text);
++            game.native_text(batch, &text, [x + width - PAD - w, row + 2.0], 0xAAAAAA, true);
++        }
++        row += 12.0;
+     }
+ }
+diff --git a/native-mods/voicechat/mixins/voicechat/screen.rs b/native-mods/voicechat/mixins/voicechat/screen.rs
+index 0f591dd..048a95e 100644
+--- a/native-mods/voicechat/mixins/voicechat/screen.rs
++++ b/native-mods/voicechat/mixins/voicechat/screen.rs
+@@ -1,5 +1,5 @@
+ // Draws the voice chat menu: the connection, the controls, the hotkeys as
+-// bound now, and the groups.
++// bound now, the players with their faces, and the groups.
+ fn voicechat_screen(
+     game: &crate::game::Game<'_>,
+     batch: &mut horizon_client::hud::HudBatch,
+@@ -14,7 +14,8 @@ fn voicechat_screen(
+         .map(|(name, what, default)| (what.to_string(), vc::key_label(&game.native_mod_key(vc::ID, name, default))))
+         .collect();
+     let measure = |t: &str| game.native_text_width(t);
+-    for draw in vc::menu_draw([batch.width, batch.height], screen.mouse, &measure, hotkeys) {
++    let head_of = |name: &str| game.native_player_head(name);
++    for draw in vc::menu_draw([batch.width, batch.height], screen.mouse, &measure, hotkeys, &head_of) {
+         match draw {
+             vc::ui::Draw::Fill(rect, argb) => game.native_fill(batch, rect, argb),
+             vc::ui::Draw::Text(text, at, rgb, shadow) => game.native_text(batch, &text, at, rgb, shadow),
+diff --git a/native-mods/voicechat/mixins/voicechat/settings.rs b/native-mods/voicechat/mixins/voicechat/settings.rs
+deleted file mode 100644
+index 913ee08..0000000
+--- a/native-mods/voicechat/mixins/voicechat/settings.rs
++++ /dev/null
+@@ -1,12 +0,0 @@
+-// The mod's settings page: activation, microphone, volumes and the protocol.
+-fn voicechat_page(game: &mut crate::game::Game<'_>, mod_id: &str, buttons: &mut Vec<String>) {
+-    use voicechat_engine as vc;
+-    if mod_id != vc::ID {
+-        return;
+-    }
+-    {
+-        let game = &*game;
+-        vc::load(&|k| game.native_setting(vc::ID, k));
+-    }
+-    buttons.extend(vc::settings_buttons());
+-}
