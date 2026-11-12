@@ -68,6 +68,29 @@ pub fn head(player: &str) -> Option<HeadSkin> {
     None
 }
 
+/// The head of another player, from the public profile: like [`head`] without
+/// the account's own prepared skin, which would wrongly stand for any name.
+/// `None` while the request is in flight and for names with no profile.
+pub fn head_remote(player: &str) -> Option<HeadSkin> {
+    let name = player.trim();
+    if name.is_empty() || name.len() > 16 || name.contains(char::is_whitespace) {
+        return None;
+    }
+    let mut map = cache().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(found) = map.get(name) {
+        return *found;
+    }
+    map.insert(name.to_owned(), None);
+    let wanted = name.to_owned();
+    std::thread::spawn(move || {
+        let found = fetch(&wanted);
+        if let Ok(mut map) = cache().lock() {
+            map.insert(wanted, found);
+        }
+    });
+    None
+}
+
 /// The skin this launch will actually use, already normalized to 64x64 RGBA.
 fn prepared_skin() -> Option<HeadSkin> {
     let appearance = crate::skins::appearance::current()?;

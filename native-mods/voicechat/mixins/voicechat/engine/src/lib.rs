@@ -8,6 +8,7 @@ pub mod audio;
 pub mod buf;
 pub mod crypt;
 pub mod labels;
+pub mod look;
 pub mod mix;
 pub mod net;
 pub mod opus;
@@ -18,7 +19,7 @@ use audio::{AudioIo, Devices, MicQueue};
 use mix::{Listener, Mixer};
 use net::{Conn, Mode, Redirect, Shared, Status};
 use proto::{COMPAT_26, COMPAT_27, Group, PlayerState, Secret};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -44,8 +45,8 @@ pub const DEFAULT_MENU: &str = "key.keyboard.v";
 pub const HOTKEYS: [(&str, &str, &str); 5] = [
     (KEY_MENU, "Open this menu", DEFAULT_MENU),
     (KEY_PTT, "Push to talk", DEFAULT_PTT),
-    (KEY_WHISPER, "Whisper", DEFAULT_WHISPER),
-    (KEY_MUTE, "Mute microphone", DEFAULT_MUTE),
+    (KEY_WHISPER, "Whisper (nearby only)", DEFAULT_WHISPER),
+    (KEY_MUTE, "Mute / unmute mic", DEFAULT_MUTE),
     (KEY_DISABLE, "Voice chat off / on", DEFAULT_DISABLE),
 ];
 
@@ -83,6 +84,8 @@ pub struct Settings {
     pub mode: Mode,
     pub muted: bool,
     pub disabled: bool,
+    /// Hear nobody, but stay heard.
+    pub deafened: bool,
     pub volume: u32,
     pub mic_gain: u32,
     pub threshold: i32,
@@ -98,6 +101,7 @@ impl Default for Settings {
             mode: if cfg!(target_os = "android") { Mode::Voice } else { Mode::PushToTalk },
             muted: false,
             disabled: false,
+            deafened: false,
             volume: 100,
             mic_gain: 100,
             threshold: -50,
@@ -129,6 +133,7 @@ impl Settings {
             },
             muted: get("muted").as_deref() == Some("true"),
             disabled: get("disabled").as_deref() == Some("true"),
+            deafened: get("deafened").as_deref() == Some("true"),
             volume: num("volume").map_or(d.volume, |v| v.clamp(0, 200) as u32),
             mic_gain: num("mic_gain").map_or(d.mic_gain, |v| v.clamp(10, 500) as u32),
             threshold: num("threshold").map_or(d.threshold, |v| v.clamp(-127, 0) as i32),
@@ -147,6 +152,7 @@ impl Settings {
             ("mode", if self.mode == Mode::Voice { "voice" } else { "ptt" }.into()),
             ("muted", self.muted.to_string()),
             ("disabled", self.disabled.to_string()),
+            ("deafened", self.deafened.to_string()),
             ("volume", self.volume.to_string()),
             ("mic_gain", self.mic_gain.to_string()),
             ("threshold", self.threshold.to_string()),
@@ -289,6 +295,15 @@ struct Voice {
     devices: Arc<Mutex<Devices>>,
     redirect: Option<Redirect>,
     menu: ui::Menu,
+    /// Each player's voice, in percent, and whether it is muted: what the
+    /// menu set, kept between sessions by UUID.
+    prefs: HashMap<u128, (u32, bool)>,
+    prefs_seen: HashSet<u128>,
+    started: Instant,
+}
+
+fn pref_key(kind: &str, id: u128) -> String {
+    format!("{kind}.{id:032x}")
 }
 
 fn voice() -> MutexGuard<'static, Voice> {
@@ -306,6 +321,9 @@ fn voice() -> MutexGuard<'static, Voice> {
             devices: Arc::new(Mutex::new(Devices::default())),
             redirect: None,
             menu: ui::Menu::default(),
+            prefs: HashMap::new(),
+            prefs_seen: HashSet::new(),
+            started: Instant::now(),
         })
     });
     VOICE.lock().unwrap_or_else(|e| e.into_inner())
@@ -344,6 +362,7 @@ impl Voice {
         c.mode = s.mode;
         c.muted = s.muted;
         c.disabled = s.disabled;
+        c.deafened = s.deafened;
         c.volume = s.volume as f32 / 100.0;
         c.mic_gain = s.mic_gain as f32 / 100.0;
         c.threshold_db = s.threshold as f32;
@@ -353,6 +372,24 @@ impl Voice {
         self.apply_controls();
         let stored = self.settings.stored();
         self.store.extend(stored.into_iter().map(|(k, v)| (k.to_owned(), v)));
+    }
+
+    /// A player's voice set to `volume` percent, or muted, now.
+    fn apply_pref(&mut self, id: u128, volume: u32, muted: bool) {
+        self.prefs.insert(id, (volume, muted));
+        let level = if muted { 0.0 } else { volume as f32 / 100.0 };
+        self.shared.controls.lock().unwrap().player_volumes.insert(id, level);
+    }
+
+    /// The same, and kept for next time.
+    fn set_pref(&mut self, id: u128, volume: u32, muted: bool) {
+        self.apply_pref(id, volume, muted);
+        self.store.push((pref_key("pv", id), volume.to_string()));
+        self.store.push((pref_key("pm", id), muted.to_string()));
+    }
+
+    fn pref(&self, id: u128) -> (u32, bool) {
+        self.prefs.get(&id).copied().unwrap_or((100, false))
     }
 
     fn send(&mut self, (channel, data): (&str, Vec<u8>)) {
@@ -491,6 +528,19 @@ impl Voice {
             *self.shared.listener.lock().unwrap() = l;
         }
         *self.shared.players.lock().unwrap() = world.players.into_iter().collect();
+        let unseen: Vec<u128> = self
+            .session
+            .as_ref()
+            .map(|s| s.states.keys().copied().filter(|id| !self.prefs_seen.contains(id)).collect())
+            .unwrap_or_default();
+        for id in unseen {
+            self.prefs_seen.insert(id);
+            let volume = get(&pref_key("pv", id)).and_then(|v| v.parse::<u32>().ok()).map(|v| v.min(300));
+            let muted = get(&pref_key("pm", id)).as_deref() == Some("true");
+            if volume.is_some() || muted {
+                self.apply_pref(id, volume.unwrap_or(100), muted);
+            }
+        }
 
         let protocol = self.settings.protocol;
         let session = self.session.as_mut().expect("made above");
@@ -614,7 +664,7 @@ impl Voice {
         }
     }
 
-    fn view(&self, hotkeys: Vec<(String, String)>) -> ui::View {
+    fn view(&self, hotkeys: Vec<(String, String)>, head_of: &dyn Fn(&str) -> Option<look::HeadPixels>) -> ui::View {
         let session = self.session.as_ref();
         let connected = session.is_some_and(|s| s.secret.is_some())
             && *self.shared.status.lock().unwrap() == Status::Connected;
@@ -642,8 +692,56 @@ impl Voice {
             connected,
             groups_enabled: session.and_then(|s| s.secret.as_ref()).is_some_and(|s| s.groups),
             groups,
+            players: self.player_rows(head_of),
+            loopback: self.shared.controls.lock().unwrap().loopback,
             hotkeys,
         }
+    }
+
+    /// Who is heard when: talking first, then the player's group, then by name.
+    fn player_rows(&self, head_of: &dyn Fn(&str) -> Option<look::HeadPixels>) -> Vec<ui::PlayerRow> {
+        let Some(session) = self.session.as_ref() else { return Vec::new() };
+        let own = session.secret.as_ref().map(|s| s.player);
+        let eye = self.shared.listener.lock().unwrap().eye;
+        let at = self.shared.players.lock().unwrap();
+        let mut rows: Vec<ui::PlayerRow> = session
+            .states
+            .values()
+            .filter(|p| !p.disconnected && Some(p.uuid) != own)
+            .map(|p| {
+                let (volume, muted) = self.pref(p.uuid);
+                let heard = self.heard(p.uuid);
+                ui::PlayerRow {
+                    id: p.uuid,
+                    name: p.name.clone(),
+                    head: look::head_rects(head_of(&p.name).as_ref(), &p.name),
+                    talking: heard.is_some(),
+                    whisper: heard == Some(true),
+                    mic_muted: p.muted,
+                    voice_off: p.disabled,
+                    in_group: p.group.is_some() && p.group == session.group,
+                    distance: at.get(&p.uuid).map(|a| {
+                        let d = [a[0] - eye[0], a[1] - eye[1], a[2] - eye[2]];
+                        (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() as f32
+                    }),
+                    volume,
+                    muted,
+                }
+            })
+            .collect();
+        rows.sort_by_key(|r| (!r.talking, !r.in_group, r.name.to_lowercase()));
+        rows
+    }
+
+    /// Whether `id` was heard in the last moments, and if it was whispering.
+    fn heard(&self, id: u128) -> Option<bool> {
+        self.shared
+            .talking
+            .lock()
+            .unwrap()
+            .get(&id)
+            .filter(|(at, _)| at.elapsed() < Duration::from_millis(400))
+            .map(|(_, whisper)| *whisper)
     }
 
     /// What a click or Enter in the menu asks of the voice chat.
@@ -658,6 +756,32 @@ impl Voice {
             A::Mute => self.click(1),
             A::Disable => self.click(2),
             A::Labels => self.click(8),
+            A::Hud => self.click(7),
+            A::Deafen => {
+                self.settings.deafened = !self.settings.deafened;
+                self.save();
+            }
+            A::Loopback => {
+                let mut c = self.shared.controls.lock().unwrap();
+                c.loopback = !c.loopback;
+            }
+            A::PlayerStep(id, d) => {
+                let (volume, muted) = self.pref(id);
+                self.set_pref(id, (volume as i32 + d).clamp(0, 300) as u32, muted);
+            }
+            A::PlayerMute(id) => {
+                let (volume, muted) = self.pref(id);
+                self.set_pref(id, volume, !muted);
+            }
+            A::Slide(slider, f) => {
+                let snap = |v: f32, step: f32| (v / step).round() * step;
+                match slider {
+                    ui::Slider::Volume => self.settings.volume = snap(f * 200.0, 5.0).clamp(0.0, 200.0) as u32,
+                    ui::Slider::Gain => self.settings.mic_gain = snap(25.0 + f * 475.0, 5.0).clamp(25.0, 500.0) as u32,
+                    ui::Slider::Threshold => self.settings.threshold = (-80.0 + f * 80.0).round().clamp(-80.0, 0.0) as i32,
+                }
+                self.save();
+            }
             A::Volume(d) => {
                 self.settings.volume = (self.settings.volume as i32 + d).clamp(0, 200) as u32;
                 self.save();
@@ -748,9 +872,10 @@ pub fn menu_draw(
     mouse: [f32; 2],
     measure: &dyn Fn(&str) -> f32,
     hotkeys: Vec<(String, String)>,
+    head_of: &dyn Fn(&str) -> Option<look::HeadPixels>,
 ) -> Vec<ui::Draw> {
     let mut v = voice();
-    let view = v.view(hotkeys);
+    let view = v.view(hotkeys, head_of);
     v.menu.draw(&view, size, mouse, measure)
 }
 
@@ -806,116 +931,175 @@ pub fn take_store() -> Vec<(String, String)> {
     std::mem::take(&mut voice().store)
 }
 
-/// A line of the status the HUD shows, and its colour.
-pub struct Line {
-    pub text: String,
-    pub rgb: u32,
+/// What the microphone is doing, for the HUD's icon.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MicState {
+    /// All of voice chat is off.
+    Off,
+    Muted,
+    Idle,
+    Talking,
+    Whispering,
+    /// Not connected yet.
+    Waiting,
 }
 
-const WHITE: u32 = 0xFFFFFF;
-const GREY: u32 = 0xAAAAAA;
-const GREEN: u32 = 0x55FF55;
-const AQUA: u32 = 0x55FFFF;
-const RED: u32 = 0xFF5555;
-const YELLOW: u32 = 0xFFFF55;
+/// A player the HUD lists as heard now.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HudSpeaker {
+    pub name: String,
+    pub whisper: bool,
+    pub grouped: bool,
+    pub distance: Option<f32>,
+    /// Moves that player's bars apart from the others'.
+    pub seed: u32,
+}
 
-/// The status for the HUD, top line first: nothing on a server without
-/// voice chat.
-pub fn hud(ptt_key: &str) -> Vec<Line> {
+/// The HUD as the game draws it: icons, a level meter and who is talking.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HudView {
+    pub mic: MicState,
+    /// The microphone's level, 0 to 1, and the activation level on the same
+    /// scale (voice activation only).
+    pub level: f32,
+    pub threshold: Option<f32>,
+    pub caption: String,
+    pub deafened: bool,
+    pub group: Option<(String, usize)>,
+    /// What is wrong, in red.
+    pub problems: Vec<String>,
+    pub speakers: Vec<HudSpeaker>,
+    pub own_name: String,
+    /// Seconds, for the bars' movement.
+    pub phase: f32,
+}
+
+/// The HUD for the top left corner, or None when there is nothing to show.
+pub fn hud_view(ptt_key: &str) -> Option<HudView> {
     let v = voice();
-    let Some(session) = v.session.as_ref().filter(|_| v.settings.hud) else {
-        return Vec::new();
-    };
-    if session.secret.is_none() {
-        return Vec::new();
-    }
-    let mut lines = Vec::new();
-    let line = |text: String, rgb| Line { text, rgb };
+    let session = v.session.as_ref().filter(|s| v.settings.hud && s.secret.is_some())?;
     let status = v.shared.status.lock().unwrap().clone();
-    match status {
+    let mut problems = Vec::new();
+    match &status {
         Status::Connected => {}
-        Status::Failed(ref e) => lines.push(line(format!("Voice chat: {e}"), RED)),
-        _ => lines.push(line("Voice chat: connecting...".into(), YELLOW)),
+        Status::Failed(e) => problems.push(e.clone()),
+        _ => {}
     }
     if let Some(e) = v.shared.mic_error.lock().unwrap().as_ref() {
-        lines.push(line(format!("Voice chat: {e}"), RED));
+        problems.push(e.clone());
     }
     if let Err(e) = &v.devices.lock().unwrap().input
         && e != "not open"
     {
-        lines.push(line(format!("Microphone: {e}"), RED));
+        problems.push(format!("Mic: {e}"));
     }
     if let Err(e) = &v.devices.lock().unwrap().output
         && e != "not open"
     {
-        lines.push(line(format!("Speakers: {e}"), RED));
+        problems.push(format!("Speaker: {e}"));
     }
-    if v.settings.disabled {
-        lines.push(line("Voice chat off".into(), RED));
+    let level_db = v.shared.level();
+    let scale = |db: f32| ((db + 80.0) / 80.0).clamp(0.0, 1.0);
+    let transmitting = v.shared.transmitting.load(Ordering::Relaxed);
+    let whisper = v.shared.controls.lock().unwrap().whisper;
+    let connected = status == Status::Connected;
+    let (mic, caption) = if v.settings.disabled {
+        (MicState::Off, "Voice chat off".to_owned())
+    } else if !connected && problems.is_empty() {
+        (MicState::Waiting, "Connecting...".to_owned())
     } else if v.settings.muted {
-        lines.push(line("Microphone muted".into(), RED));
-    } else if v.shared.transmitting.load(Ordering::Relaxed) {
-        let whisper = v.shared.controls.lock().unwrap().whisper;
-        lines.push(if whisper { line("Whispering".into(), AQUA) } else { line("Talking".into(), GREEN) });
-    } else if status == Status::Connected {
-        lines.push(match v.settings.mode {
-            Mode::PushToTalk => line(format!("Push to talk: {}", key_label(ptt_key)), GREY),
-            Mode::Voice => line(format!("Voice activation ({:.0} dB)", v.shared.level()), GREY),
-        });
-    }
-    if let Some(g) = session.group.and_then(|g| session.groups.get(&g)) {
-        lines.push(line(format!("Group: {}", g.name), GREEN));
-        let mut members = session.members(g.id);
-        members.retain(|m| *m != session.own_name());
-        if !members.is_empty() {
-            lines.push(line(format!("  with {}", members.join(", ")), GREY));
-        }
-    }
+        (MicState::Muted, "Mic muted".to_owned())
+    } else if transmitting && whisper {
+        (MicState::Whispering, "Whispering".to_owned())
+    } else if transmitting {
+        (MicState::Talking, "Talking".to_owned())
+    } else {
+        (
+            MicState::Idle,
+            match v.settings.mode {
+                Mode::PushToTalk => format!("Hold {}", key_label(ptt_key)),
+                Mode::Voice => "Auto".to_owned(),
+            },
+        )
+    };
+    let own = session.own_name();
+    let group = session
+        .group
+        .and_then(|g| session.groups.get(&g))
+        .map(|g| (g.name.clone(), session.members(g.id).len()));
+    let eye = v.shared.listener.lock().unwrap().eye;
+    let at = v.shared.players.lock().unwrap();
     let now = Instant::now();
-    let mut talking: Vec<(String, bool)> = v
+    let mut speakers: Vec<HudSpeaker> = v
         .shared
         .talking
         .lock()
         .unwrap()
         .iter()
-        .filter(|(_, (at, _))| now - *at < Duration::from_millis(300))
+        .filter(|(_, (when, _))| now - *when < Duration::from_millis(300))
         .map(|(id, (_, whisper))| {
-            let name = session.states.get(id).map_or_else(|| "Someone".into(), |s| s.name.clone());
-            (name, *whisper)
+            let state = session.states.get(id);
+            let name = state.map_or_else(|| "Someone".to_owned(), |s| s.name.clone());
+            HudSpeaker {
+                seed: name.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(u32::from(b))),
+                grouped: state.is_some_and(|s| s.group.is_some() && s.group == session.group),
+                distance: at.get(id).map(|a| {
+                    let d = [a[0] - eye[0], a[1] - eye[1], a[2] - eye[2]];
+                    (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() as f32
+                }),
+                name,
+                whisper: *whisper,
+            }
         })
         .collect();
-    talking.sort();
-    for (name, whisper) in talking {
-        lines.push(line(format!("> {name}"), if whisper { AQUA } else { WHITE }));
-    }
-    lines
+    speakers.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Some(HudView {
+        mic,
+        level: scale(level_db),
+        threshold: (v.settings.mode == Mode::Voice).then(|| scale(v.settings.threshold as f32)),
+        caption,
+        deafened: v.settings.deafened,
+        group,
+        problems,
+        speakers,
+        own_name: own,
+        phase: v.started.elapsed().as_secs_f32(),
+    })
 }
 
-/// The group names to draw above the players the camera sees, on a `size`
-/// screen.
+/// The group names and the talking marks to draw above the players the
+/// camera sees, on a `size` screen.
 pub fn group_labels(camera: &labels::Camera, size: [f32; 2]) -> Vec<labels::Label> {
     let v = voice();
     let Some(session) = v.session.as_ref().filter(|s| v.settings.group_labels && s.secret.is_some()) else {
         return Vec::new();
     };
     let players = v.shared.players.lock().unwrap();
-    let shown: Vec<([f64; 3], String, bool)> = players
+    let shown: Vec<labels::Tag> = players
         .iter()
         .filter_map(|(id, eye)| {
-            let group = session.states.get(id)?.group?;
-            // Hidden groups stay hidden, unless they are the player's own.
-            let g = session.groups.get(&group).filter(|g| !g.hidden || session.group == Some(group))?;
-            Some((*eye, g.name.clone(), session.group == Some(group)))
+            let group = session.states.get(id).and_then(|p| p.group).and_then(|group| {
+                // Hidden groups stay hidden, unless they are the player's own.
+                let g = session.groups.get(&group).filter(|g| !g.hidden || session.group == Some(group))?;
+                Some((g.name.clone(), session.group == Some(group)))
+            });
+            let speaking = v.heard(*id);
+            (group.is_some() || speaking.is_some()).then(|| labels::Tag { eye: *eye, group, speaking })
         })
         .collect();
     labels::place(camera, size, &shown)
 }
 
+const GREY: u32 = 0xAAAAAA;
+const GREEN: u32 = 0x55FF55;
+const RED: u32 = 0xFF5555;
+const YELLOW: u32 = 0xFFFF55;
+
 /// `key.keyboard.caps.lock` → `Caps Lock`.
 pub fn key_label(key: &str) -> String {
     let name = key.strip_prefix("key.keyboard.").or_else(|| key.strip_prefix("key.mouse.")).unwrap_or(key);
     if name == "unknown" {
-        return "not bound".into();
+        return "not set".into();
     }
     name.split('.')
         .map(|w| {
@@ -932,6 +1116,7 @@ const HELP: &[&str] = &[
     "/vc status - the connection, devices and who has voice chat",
     "/vc mute, /vc unmute - the microphone",
     "/vc off, /vc on - all of voice chat",
+    "/vc deafen, /vc undeafen - hear nobody, but stay heard",
     "/vc mode ptt|voice - push to talk or voice activation",
     "/vc volume <0-200> - everyone's voices",
     "/vc volume <player> <0-200> - one player's voice",
@@ -960,6 +1145,11 @@ pub fn command(line: &str) -> Option<Vec<String>> {
             v.save();
             v.send_state();
             out(if v.settings.muted { "Microphone muted" } else { "Microphone on" })
+        }
+        ["deafen"] | ["undeafen"] => {
+            v.settings.deafened = args[0] == "deafen";
+            v.save();
+            out(if v.settings.deafened { "You hear nobody now" } else { "You hear voices again" })
         }
         ["off"] | ["on"] => {
             v.settings.disabled = args[0] == "off";
@@ -993,7 +1183,8 @@ pub fn command(line: &str) -> Option<Vec<String>> {
             });
             match id {
                 Some(id) => {
-                    v.shared.controls.lock().unwrap().player_volumes.insert(id, n as f32 / 100.0);
+                    let muted = v.pref(id).1;
+                    v.set_pref(id, n, muted);
                     vec![format!("{name}'s voice at {n}%")]
                 }
                 None => vec![format!("No voice chat player named {name}")],
@@ -1147,6 +1338,30 @@ mod tests {
     }
 
     #[test]
+    fn a_players_voice_is_set_and_muted_from_the_menu_and_kept() {
+        let mut v = voice();
+        v.menu_action(ui::Action::PlayerStep(42, 10));
+        v.menu_action(ui::Action::PlayerStep(42, 10));
+        assert_eq!(v.pref(42), (120, false));
+        assert_eq!(v.shared.controls.lock().unwrap().player_volumes.get(&42), Some(&1.2));
+        v.menu_action(ui::Action::PlayerMute(42));
+        assert_eq!(v.shared.controls.lock().unwrap().player_volumes.get(&42), Some(&0.0));
+        let kept: HashMap<String, String> = v.store.drain(..).collect();
+        assert_eq!(kept.get(&pref_key("pv", 42)).map(String::as_str), Some("120"));
+        assert_eq!(kept.get(&pref_key("pm", 42)).map(String::as_str), Some("true"));
+        // Back again: the volume it had.
+        v.menu_action(ui::Action::PlayerMute(42));
+        assert_eq!(v.shared.controls.lock().unwrap().player_volumes.get(&42), Some(&1.2));
+        v.menu_action(ui::Action::Deafen);
+        assert!(v.shared.controls.lock().unwrap().deafened);
+        v.menu_action(ui::Action::Deafen);
+        assert!(!v.shared.controls.lock().unwrap().deafened);
+        v.menu_action(ui::Action::Loopback);
+        assert!(v.shared.controls.lock().unwrap().loopback);
+        v.menu_action(ui::Action::Loopback);
+    }
+
+    #[test]
     fn shows_other_players_groups() {
         use buf::Writer;
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -1185,8 +1400,8 @@ mod tests {
         assert_eq!(texts, vec![("[Miners]", 0xFFFF55), ("[Builders]", 0x55FF55)]);
         let list = command("vc groups").unwrap();
         assert_eq!(list, vec!["Builders (yours): Alex, Me", "Miners: Bea"]);
-        let hud: Vec<String> = hud("key.keyboard.v").into_iter().map(|l| l.text).collect();
-        assert!(hud.contains(&"Group: Builders".to_owned()) && hud.contains(&"  with Alex".to_owned()), "{hud:?}");
+        let hud = hud_view("key.keyboard.v").expect("connected");
+        assert_eq!(hud.group, Some(("Builders".to_owned(), 2)));
 
         // The menu: a password group asks for its password, then joins.
         {
@@ -1197,10 +1412,13 @@ mod tests {
         *voice().shared.status.lock().unwrap() = Status::Connected;
         menu_open(Some('v'));
         let measure = |t: &str| t.len() as f32 * 6.0;
-        let keys = vec![("Push to talk".to_owned(), key_label(DEFAULT_PTT))];
-        let draws = menu_draw([480.0, 270.0], [0.0, 0.0], &measure, keys.clone());
+        let keys = vec![("Open this menu".to_owned(), "V".to_owned()), ("Push to talk".to_owned(), key_label(DEFAULT_PTT))];
         let has = |d: &[ui::Draw], want: &str| d.iter().any(|d| matches!(d, ui::Draw::Text(t, ..) if t == want));
-        assert!(has(&draws, "Caps Lock") && has(&draws, "Miners (password)") && has(&draws, "Alex, Me"));
+        let draws = menu_draw([480.0, 270.0], [0.0, 0.0], &measure, keys.clone(), &|_| None);
+        assert!(has(&draws, "Voice volume") && has(&draws, "Hold Caps Lock to talk") == (voice().settings.mode == Mode::PushToTalk));
+        voice().menu.tab = ui::Tab::Groups;
+        let draws = menu_draw([480.0, 270.0], [0.0, 0.0], &measure, keys.clone(), &|_| None);
+        assert!(has(&draws, "Miners (password)") && has(&draws, "Alex, Me"));
         let join = voice().menu.hit_rect(&ui::Action::Join(0x62)).unwrap();
         tick(Some(world("groups.example.net")), &none);
         menu_click([join[0] + 1.0, join[1] + 1.0]);

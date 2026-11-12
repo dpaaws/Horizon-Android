@@ -2651,6 +2651,8 @@ struct Game<'a> {
     hoppers: HashMap<(i32, i32, i32), machines::HopperState>,
     /// The screen of a mod block's menu open on this client (`native_screen`).
     mod_screen: Option<native_hooks::OpenNativeScreen>,
+    /// The native mod whose own screen is open (`native_mod_screen_open`).
+    native_ui: Option<String>,
     /// Where item entities are, while the block entities tick (hoppers).
     item_columns: Option<machines::ItemColumns>,
     creative_screen: Creative,
@@ -8426,6 +8428,7 @@ impl Game<'_> {
                 self.draw_creative(&mut batch);
             }
             Screen::Chat => self.draw_chat_screen(&mut batch),
+            Screen::Mod if self.native_ui.is_some() => {}
             Screen::Mod => self.draw_mod_screen(&mut batch),
             Screen::Playing | Screen::Options | Screen::Win => {}
         }
@@ -15653,7 +15656,7 @@ impl Game<'_> {
             }
             return Ok(());
         }
-        if self.screen == Screen::Mod && self.mod_screen_key(key) {
+        if self.screen == Screen::Mod && self.native_ui.is_none() && self.mod_screen_key(key) {
             return Ok(());
         }
         if self.sort_key_press(key) || self.hdr_key_press(key) {
@@ -15701,6 +15704,11 @@ impl Game<'_> {
                 Screen::BlockEditor => self.close_block_editor(),
                 Screen::Chat => self.close_chat(chat::ChatExit::Intentional),
                 Screen::Win => self.close_win_screen()?,
+                Screen::Mod if self.native_ui.is_some() => {
+                    if let Some(id) = self.native_ui.clone() {
+                        self.native_mod_screen_close(&id);
+                    }
+                }
                 Screen::Mod => self.close_mod_screen(true),
                 Screen::DebugOptions => self.close_debug_options(),
             },
@@ -17473,7 +17481,7 @@ impl Game<'_> {
                     if self.screen == Screen::Options && d != 0.0 {
                         self.options_scroll(d)?;
                     }
-                    if self.screen == Screen::Mod && d != 0.0 {
+                    if self.screen == Screen::Mod && d != 0.0 && self.native_ui.is_none() {
                         self.mod_screen_scroll(d);
                     }
                     // AbstractContainerScreen.mouseScrolled: a bundle under the
@@ -17755,7 +17763,9 @@ impl Game<'_> {
                             self.stats_click(size);
                         }
                         Screen::Stats if button == MouseButton::Left => self.stats_release(),
-                        Screen::Mod if pressed => self.mod_screen_click(button),
+                        Screen::Mod if pressed && self.native_ui.is_none() => {
+                            self.mod_screen_click(button)
+                        }
                         _ => {}
                     }
                 }
@@ -18820,6 +18830,7 @@ impl<'a> Game<'a> {
             tnts: Vec::new(),
             hoppers: HashMap::new(),
             mod_screen: None,
+            native_ui: None,
             item_columns: None,
             creative_screen: prepared.creative_screen,
             control: None,

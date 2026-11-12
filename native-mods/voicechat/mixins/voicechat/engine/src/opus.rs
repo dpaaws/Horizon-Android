@@ -12,6 +12,10 @@ pub const APPLICATION_VOIP: i32 = 2048;
 pub const APPLICATION_AUDIO: i32 = 2049;
 pub const APPLICATION_RESTRICTED_LOWDELAY: i32 = 2051;
 const OPUS_RESET_STATE: c_int = 4028;
+const OPUS_SET_COMPLEXITY: c_int = 4010;
+/// 0 to 10, 9 by default: speech sounds the same at 3 for a fraction of the
+/// work, which a phone's weak cores feel.
+const COMPLEXITY: c_int = 3;
 
 type EncoderCreate = unsafe extern "C" fn(i32, c_int, c_int, *mut c_int) -> *mut c_void;
 type Encode = unsafe extern "C" fn(*mut c_void, *const i16, c_int, *mut u8, i32) -> i32;
@@ -134,6 +138,7 @@ impl Encoder {
         if raw.is_null() || err != 0 {
             return Err(format!("opus_encoder_create failed ({err})"));
         }
+        unsafe { (api.encoder_ctl)(raw, OPUS_SET_COMPLEXITY, COMPLEXITY) };
         Ok(Self { api, raw, max_bytes: max_bytes.clamp(64, 1275) })
     }
 

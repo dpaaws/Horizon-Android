@@ -371,12 +371,51 @@ impl Settings {
                 ..Self::default()
             },
         };
+        #[cfg(target_os = "android")]
+        let settings = {
+            let mut settings = settings;
+            settings.apply_low_end_once(path);
+            settings
+        };
         settings.describe_for_crashes();
         // Options.load: the backend asked for at startup, what a restart is measured from.
         Self {
             startup_api: settings.horizon.api,
             ..settings
         }
+    }
+    /// The first start of this build on Android: settings for a weak phone
+    /// (3 GB of memory, an entry-level GPU: Vivo Y12, Helio P22), once.
+    /// Everything stays changeable in Options > Video afterwards, and the
+    /// marker file keeps later starts from touching what the player chose.
+    #[cfg(target_os = "android")]
+    fn apply_low_end_once(&mut self, path: &Path) {
+        let Some(dir) = path.parent() else { return };
+        let marker = dir.join("horizon-lowend-v1");
+        if marker.exists() {
+            return;
+        }
+        crate::graphics::apply_preset(crate::graphics::Preset::Performance, self);
+        self.render_distance = 6;
+        self.simulation_distance = 5;
+        self.max_fps = 30;
+        self.vsync = false;
+        self.smooth_lighting = false;
+        self.vignette = false;
+        self.chunk_fade = 0.0;
+        self.entity_distance = 0.5;
+        self.weather_radius = 3;
+        let g = &mut self.horizon;
+        g.resolution_scale = 50;
+        g.far_detail = crate::graphics::FarDetail::Reduced;
+        g.animated_textures = false;
+        g.fxaa = false;
+        g.taa = false;
+        g.shadow_cache = false;
+        g.workers = 3;
+        g.texture_budget_mib = 768;
+        self.save(path);
+        let _ = fs::write(marker, "applied\n");
     }
     /// The render settings and resource packs a crash report lists.
     fn describe_for_crashes(&self) {

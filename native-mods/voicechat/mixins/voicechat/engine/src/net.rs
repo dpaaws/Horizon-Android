@@ -31,6 +31,10 @@ pub struct Controls {
     pub whisper: bool,
     pub muted: bool,
     pub disabled: bool,
+    /// Hear nobody (the microphone stays as it is).
+    pub deafened: bool,
+    /// Play the microphone back, to test it (not stored).
+    pub loopback: bool,
     pub threshold_db: f32,
     pub mic_gain: f32,
     pub volume: f32,
@@ -45,6 +49,8 @@ impl Default for Controls {
             whisper: false,
             muted: false,
             disabled: false,
+            deafened: false,
+            loopback: false,
             threshold_db: -50.0,
             mic_gain: 1.0,
             volume: 1.0,
@@ -167,11 +173,17 @@ fn run(
     // The mic thread stops with this one, whatever ends it.
     let quit = Arc::new(AtomicBool::new(false));
     let mic_thread = {
-        let (socket, link, shared, connected, quit) =
-            (socket.try_clone().map_err(|e| e.to_string())?, link.clone(), shared.clone(), connected.clone(), quit.clone());
+        let (socket, link, shared, connected, quit, mixer) = (
+            socket.try_clone().map_err(|e| e.to_string())?,
+            link.clone(),
+            shared.clone(),
+            connected.clone(),
+            quit.clone(),
+            mixer.clone(),
+        );
         std::thread::Builder::new()
             .name("voicechat-mic".into())
-            .spawn(move || mic_loop(&socket, &link, &shared, &mic, &quit, &connected))
+            .spawn(move || mic_loop(&socket, &link, &shared, &mic, &quit, &connected, &mixer))
             .ok()
     };
 
@@ -294,7 +306,7 @@ fn play(s: Sound, own: u128, shared: &Shared, mixer: &Mutex<Mixer>, channels: &m
 
     let (volume, listener) = {
         let c = shared.controls.lock().unwrap();
-        let v = c.volume * c.player_volumes.get(&s.sender).copied().unwrap_or(1.0);
+        let v = if c.deafened { 0.0 } else { c.volume * c.player_volumes.get(&s.sender).copied().unwrap_or(1.0) };
         (v, *shared.listener.lock().unwrap())
     };
     let gain = match s.kind {
@@ -321,7 +333,18 @@ fn play(s: Sound, own: u128, shared: &Shared, mixer: &Mutex<Mixer>, channels: &m
 
 /// `MicThread`: each 20 ms frame of the microphone, sent while the push to
 /// talk key is held or the voice is loud enough, and a little after.
-fn mic_loop(socket: &UdpSocket, link: &Link, shared: &Shared, mic: &MicQueue, stop: &AtomicBool, connected: &AtomicBool) {
+/// The channel the microphone test plays on (no player has this id).
+pub const LOOPBACK: u128 = u128::MAX;
+
+fn mic_loop(
+    socket: &UdpSocket,
+    link: &Link,
+    shared: &Shared,
+    mic: &MicQueue,
+    stop: &AtomicBool,
+    connected: &AtomicBool,
+    mixer: &Mutex<Mixer>,
+) {
     let mut encoder = match Encoder::new(link.secret.opus_application(), link.secret.mtu) {
         Ok(e) => e,
         Err(e) => {
@@ -383,5 +406,13 @@ fn mic_loop(socket: &UdpSocket, link: &Link, shared: &Shared, mic: &MicQueue, st
             hold = 0;
         }
         shared.transmitting.store(sending, Ordering::Relaxed);
+        // The microphone test: what would be sent plays back at once.
+        let mut m = mixer.lock().unwrap();
+        if c.loopback && talk {
+            let pcm = pcm.iter().map(|s| f32::from(*s) / 32768.0).collect();
+            m.push(LOOPBACK, Frame { pcm, gain: [c.volume.min(1.0); 2] });
+        } else {
+            m.end(LOOPBACK);
+        }
     }
 }

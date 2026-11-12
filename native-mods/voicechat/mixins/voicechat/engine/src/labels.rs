@@ -59,21 +59,30 @@ pub const RANGE: f64 = 64.0;
 /// Above the eyes, clear of the name tag.
 const ABOVE_EYES: f64 = 0.95;
 
-/// A label's text centred at `at` (GUI pixels), in `rgb`.
+/// A label centred at `at` (GUI pixels): the group's text in `rgb`, and a
+/// talking mark when the player is heard now (`Some(true)` for a whisper).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Label {
     pub text: String,
     pub at: [f32; 2],
     pub rgb: u32,
+    pub speaking: Option<bool>,
 }
 
-/// The labels for `players` (eye position, group name, whether it is the
-/// player's own group), the farthest first so the nearest draws on top.
-pub fn place(camera: &Camera, size: [f32; 2], players: &[([f64; 3], String, bool)]) -> Vec<Label> {
+/// What to mark on a player: the eye position, the group's name and whether it
+/// is the player's own, and whether the player is heard.
+pub struct Tag {
+    pub eye: [f64; 3],
+    pub group: Option<(String, bool)>,
+    pub speaking: Option<bool>,
+}
+
+/// The labels for `players`, the farthest first so the nearest draws on top.
+pub fn place(camera: &Camera, size: [f32; 2], players: &[Tag]) -> Vec<Label> {
     let mut placed: Vec<(f64, Label)> = players
         .iter()
-        .filter_map(|(eye, group, ours)| {
-            let point = [eye[0], eye[1] + ABOVE_EYES, eye[2]];
+        .filter_map(|t| {
+            let point = [t.eye[0], t.eye[1] + ABOVE_EYES, t.eye[2]];
             let d = sub(point, camera.pos);
             let distance = dot(d, d).sqrt();
             if distance > RANGE {
@@ -82,7 +91,11 @@ pub fn place(camera: &Camera, size: [f32; 2], players: &[([f64; 3], String, bool
             let at = project(camera, point, size)?;
             let on_screen = (0.0..=size[0]).contains(&at[0]) && (0.0..=size[1]).contains(&at[1]);
             on_screen.then(|| {
-                (distance, Label { text: format!("[{group}]"), at, rgb: if *ours { 0x55FF55 } else { 0xFFFF55 } })
+                let (text, rgb) = match &t.group {
+                    Some((name, ours)) => (format!("[{name}]"), if *ours { 0x55FF55 } else { 0xFFFF55 }),
+                    None => (String::new(), 0xFFFFFF),
+                };
+                (distance, Label { text, at, rgb, speaking: t.speaking })
             })
         })
         .collect();
@@ -98,12 +111,8 @@ mod tests {
     fn a_player_ahead_gets_a_label_above_the_middle() {
         let camera = Camera { pos: [0.0, 65.62, 0.0], yaw: 0.0, pitch: 0.0, fov: 70.0 };
         let size = [400.0, 200.0];
-        let players = vec![
-            ([0.0, 65.62, 10.0], "Builders".to_owned(), false),
-            ([0.0, 65.62, 5.0], "Mine".to_owned(), true),
-            ([0.0, 65.62, -10.0], "Behind".to_owned(), false),
-            ([0.0, 65.62, 100.0], "Far".to_owned(), false),
-        ];
+        let tag = |z: f64, name: &str, ours: bool| Tag { eye: [0.0, 65.62, z], group: Some((name.to_owned(), ours)), speaking: None };
+        let players = vec![tag(10.0, "Builders", false), tag(5.0, "Mine", true), tag(-10.0, "Behind", false), tag(100.0, "Far", false)];
         let labels = place(&camera, size, &players);
         assert_eq!(labels.len(), 2);
         // The farther one first, the nearer drawn over it.

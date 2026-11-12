@@ -10114,6 +10114,11 @@ impl Game<'_> {
         let charts = self.debug_charts.corners(!self.has_singleplayer_server());
         !debug_takes(corner, self.debug, charts)
     }
+    /// Another player's face and the hat over it, `0xRRGGBB` pixels (`0` where
+    /// the skin has no hat): None until their profile's skin is known.
+    pub(super) fn native_player_head(&self, name: &str) -> Option<([[u32; 8]; 8], [[u32; 8]; 8])> {
+        crate::skin_head::head_remote(name).map(|h| (h.front, h.hat))
+    }
     /// The width of `text` in GUI pixels.
     pub(super) fn native_text_width(&self, text: &str) -> f32 {
         HudBatch::text_width(&self.gui.atlas, text)
@@ -10883,6 +10888,50 @@ impl Game<'_> {
                 screen,
                 data: Vec::new(),
             });
+        }
+    }
+    /// The native mod whose own screen is open (`mod_screen`).
+    pub(super) fn native_mod_screen(&self) -> Option<&str> {
+        self.native_ui
+            .as_deref()
+            .filter(|_| self.screen == Screen::Mod)
+    }
+    /// Opens `mod_id`'s own screen over the world (`mod_screen_open`): the
+    /// screen hooks fire over it, the mouse is freed and Escape closes it.
+    /// False while another screen, a prompt or a load is up.
+    pub(super) fn native_mod_screen_open(&mut self, mod_id: &str) -> bool {
+        if self.native_mod_screen().is_none() {
+            // Another screen replaced it: the id is stale.
+            self.native_ui = None;
+        }
+        if let Some(open) = self.native_ui.as_deref() {
+            return open == mod_id;
+        }
+        if self.screen != Screen::Playing
+            || self.title.is_some()
+            || self.player.is_none()
+            || self.renderer.is_none()
+            || self.screen_over_playing()
+            || self.remote_loading()
+        {
+            return false;
+        }
+        self.native_ui = Some(mod_id.to_owned());
+        self.screen = Screen::Mod;
+        self.capture(false);
+        true
+    }
+    /// Closes `mod_id`'s own screen, if it is the one open (`mod_screen_close`).
+    pub(super) fn native_mod_screen_close(&mut self, mod_id: &str) {
+        if self.native_ui.as_deref() != Some(mod_id) {
+            return;
+        }
+        self.native_ui = None;
+        if self.screen == Screen::Mod {
+            self.screen = Screen::Playing;
+            if self.player.is_some() {
+                self.capture(true);
+            }
         }
     }
     /// The mod screen showing now, if any.
