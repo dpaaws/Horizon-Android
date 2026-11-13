@@ -10117,7 +10117,7 @@ impl Game<'_> {
     /// Another player's face and the hat over it, `0xRRGGBB` pixels (`0` where
     /// the skin has no hat): None until their profile's skin is known.
     pub(super) fn native_player_head(&self, name: &str) -> Option<([[u32; 8]; 8], [[u32; 8]; 8])> {
-        crate::skin_head::head_remote(name).map(|h| (h.front, h.hat))
+        horizon_client::skin_head::head_remote(name).map(|h| (h.front, h.hat))
     }
     /// The width of `text` in GUI pixels.
     pub(super) fn native_text_width(&self, text: &str) -> f32 {

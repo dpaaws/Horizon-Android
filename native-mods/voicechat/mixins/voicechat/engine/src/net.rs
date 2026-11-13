@@ -35,6 +35,10 @@ pub struct Controls {
     pub deafened: bool,
     /// Play the microphone back, to test it (not stored).
     pub loopback: bool,
+    /// Fade out steady background noise between words.
+    pub denoise: bool,
+    /// Even out a quiet or loud microphone.
+    pub auto_gain: bool,
     pub threshold_db: f32,
     pub mic_gain: f32,
     pub volume: f32,
@@ -51,6 +55,8 @@ impl Default for Controls {
             disabled: false,
             deafened: false,
             loopback: false,
+            denoise: true,
+            auto_gain: true,
             threshold_db: -50.0,
             mic_gain: 1.0,
             volume: 1.0,
@@ -355,6 +361,7 @@ fn mic_loop(
     let mut sequence: i64 = 0;
     let mut sending = false;
     let mut hold = 0u32;
+    let mut cleaner = crate::dsp::Cleaner::default();
     let send = |p: &Out| {
         let _ = socket.send(&link.write(p));
     };
@@ -370,10 +377,15 @@ fn mic_loop(
             q.drain(..FRAME).collect()
         };
         let c = shared.controls.lock().unwrap().clone();
+        let mut frame = frame;
+        for s in frame.iter_mut() {
+            *s *= c.mic_gain;
+        }
+        cleaner.process(&mut frame, c.denoise, c.auto_gain);
         let mut pcm = [0i16; FRAME];
         let mut peak = 0f32;
         for (o, s) in pcm.iter_mut().zip(&frame) {
-            let v = (s * c.mic_gain).clamp(-1.0, 1.0);
+            let v = s.clamp(-1.0, 1.0);
             peak = peak.max(v.abs());
             *o = (v * 32767.0) as i16;
         }

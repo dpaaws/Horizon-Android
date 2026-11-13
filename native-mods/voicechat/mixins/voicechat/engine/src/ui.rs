@@ -21,6 +21,7 @@ pub enum Action {
     Labels,
     Hud,
     Deafen,
+    Clean,
     Loopback,
     /// Step one player's volume by this many percent.
     PlayerStep(u128, i32),
@@ -546,6 +547,13 @@ impl Menu {
             &format!("Corner display: {}", if s.hud { "Shown" } else { "Hidden" }),
             Action::Hud,
             Some(s.hud),
+        );
+        y += 21.0;
+        out.button(
+            [x, y, w, 18.0],
+            &format!("Clean mic: {}", if s.clean { "On" } else { "Off" }),
+            Action::Clean,
+            Some(s.clean),
         );
         y += 24.0;
         out.ink("Hotkeys", [x, y], INK);

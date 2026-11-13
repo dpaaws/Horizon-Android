@@ -7,6 +7,7 @@
 pub mod audio;
 pub mod buf;
 pub mod crypt;
+pub mod dsp;
 pub mod labels;
 pub mod look;
 pub mod mix;
@@ -86,6 +87,8 @@ pub struct Settings {
     pub disabled: bool,
     /// Hear nobody, but stay heard.
     pub deafened: bool,
+    /// Mic clean-up: fade background noise, even out the volume.
+    pub clean: bool,
     pub volume: u32,
     pub mic_gain: u32,
     pub threshold: i32,
@@ -102,6 +105,7 @@ impl Default for Settings {
             muted: false,
             disabled: false,
             deafened: false,
+            clean: true,
             volume: 100,
             mic_gain: 100,
             threshold: -50,
@@ -134,6 +138,7 @@ impl Settings {
             muted: get("muted").as_deref() == Some("true"),
             disabled: get("disabled").as_deref() == Some("true"),
             deafened: get("deafened").as_deref() == Some("true"),
+            clean: get("clean").as_deref() != Some("false"),
             volume: num("volume").map_or(d.volume, |v| v.clamp(0, 200) as u32),
             mic_gain: num("mic_gain").map_or(d.mic_gain, |v| v.clamp(10, 500) as u32),
             threshold: num("threshold").map_or(d.threshold, |v| v.clamp(-127, 0) as i32),
@@ -153,6 +158,7 @@ impl Settings {
             ("muted", self.muted.to_string()),
             ("disabled", self.disabled.to_string()),
             ("deafened", self.deafened.to_string()),
+            ("clean", self.clean.to_string()),
             ("volume", self.volume.to_string()),
             ("mic_gain", self.mic_gain.to_string()),
             ("threshold", self.threshold.to_string()),
@@ -363,6 +369,8 @@ impl Voice {
         c.muted = s.muted;
         c.disabled = s.disabled;
         c.deafened = s.deafened;
+        c.denoise = s.clean;
+        c.auto_gain = s.clean;
         c.volume = s.volume as f32 / 100.0;
         c.mic_gain = s.mic_gain as f32 / 100.0;
         c.threshold_db = s.threshold as f32;
@@ -759,6 +767,10 @@ impl Voice {
             A::Hud => self.click(7),
             A::Deafen => {
                 self.settings.deafened = !self.settings.deafened;
+                self.save();
+            }
+            A::Clean => {
+                self.settings.clean = !self.settings.clean;
                 self.save();
             }
             A::Loopback => {
