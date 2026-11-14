@@ -6,6 +6,8 @@
 //! HUD and settings functions; the voice runs on threads of its own.
 pub mod audio;
 pub mod buf;
+pub mod check;
+pub mod rec;
 pub mod crypt;
 pub mod dsp;
 pub mod labels;
@@ -89,6 +91,14 @@ pub struct Settings {
     pub deafened: bool,
     /// Mic clean-up: fade background noise, even out the volume.
     pub clean: bool,
+    /// Voice changer preset (index into `dsp::Fx::ALL`).
+    pub fx: dsp::Fx,
+    /// The copied voice: its pitch in Hz (0 while it is still to be heard),
+    /// who it was, and our own usual pitch. Kept until reset or changed.
+    pub copy_hz: f32,
+    pub copy_name: String,
+    pub copy_id: u128,
+    pub own_hz: f32,
     pub volume: u32,
     pub mic_gain: u32,
     pub threshold: i32,
@@ -106,6 +116,11 @@ impl Default for Settings {
             disabled: false,
             deafened: false,
             clean: true,
+            fx: dsp::Fx::Off,
+            copy_hz: 0.0,
+            copy_name: String::new(),
+            copy_id: 0,
+            own_hz: 0.0,
             volume: 100,
             mic_gain: 100,
             threshold: -50,
@@ -139,6 +154,11 @@ impl Settings {
             disabled: get("disabled").as_deref() == Some("true"),
             deafened: get("deafened").as_deref() == Some("true"),
             clean: get("clean").as_deref() != Some("false"),
+            fx: get("fx").and_then(|v| v.parse().ok()).map(dsp::Fx::from_index).unwrap_or_default(),
+            copy_hz: get("copy_hz").and_then(|v| v.parse::<f32>().ok()).filter(|v| (50.0..=500.0).contains(v)).unwrap_or(0.0),
+            copy_name: get("copy_name").unwrap_or_default().chars().take(24).collect(),
+            copy_id: get("copy_id").and_then(|v| u128::from_str_radix(&v, 16).ok()).unwrap_or(0),
+            own_hz: get("own_hz").and_then(|v| v.parse::<f32>().ok()).filter(|v| (50.0..=500.0).contains(v)).unwrap_or(0.0),
             volume: num("volume").map_or(d.volume, |v| v.clamp(0, 200) as u32),
             mic_gain: num("mic_gain").map_or(d.mic_gain, |v| v.clamp(10, 500) as u32),
             threshold: num("threshold").map_or(d.threshold, |v| v.clamp(-127, 0) as i32),
@@ -159,6 +179,11 @@ impl Settings {
             ("disabled", self.disabled.to_string()),
             ("deafened", self.deafened.to_string()),
             ("clean", self.clean.to_string()),
+            ("fx", self.fx.index().to_string()),
+            ("copy_hz", format!("{:.1}", self.copy_hz)),
+            ("copy_name", self.copy_name.clone()),
+            ("copy_id", format!("{:032x}", self.copy_id)),
+            ("own_hz", format!("{:.1}", self.own_hz)),
             ("volume", self.volume.to_string()),
             ("mic_gain", self.mic_gain.to_string()),
             ("threshold", self.threshold.to_string()),
@@ -306,6 +331,8 @@ struct Voice {
     prefs: HashMap<u128, (u32, bool)>,
     prefs_seen: HashSet<u128>,
     started: Instant,
+    /// The microphone test while no voice connection runs.
+    check: Option<check::LocalCheck>,
 }
 
 fn pref_key(kind: &str, id: u128) -> String {
@@ -330,6 +357,7 @@ fn voice() -> MutexGuard<'static, Voice> {
             prefs: HashMap::new(),
             prefs_seen: HashSet::new(),
             started: Instant::now(),
+            check: None,
         })
     });
     VOICE.lock().unwrap_or_else(|e| e.into_inner())
@@ -362,6 +390,35 @@ fn compat_key(address: &str) -> String {
 }
 
 impl Voice {
+    /// Forgets the copied voice.
+    fn reset_copy(&mut self) {
+        self.settings.fx = dsp::Fx::Off;
+        self.settings.copy_hz = 0.0;
+        self.settings.copy_id = 0;
+        self.settings.copy_name.clear();
+    }
+
+    /// Learns the voice being copied once it is heard, and our own pitch.
+    fn learn_pitches(&mut self) {
+        let mut changed = false;
+        if self.settings.fx == dsp::Fx::Copy && self.settings.copy_hz == 0.0 {
+            let heard = self.shared.pitches.lock().unwrap().get(&self.settings.copy_id).copied();
+            if let Some(hz) = heard {
+                self.settings.copy_hz = hz;
+                self.menu.say(format!("Copied {}'s voice", self.settings.copy_name), false);
+                changed = true;
+            }
+        }
+        let own = f32::from_bits(self.shared.own_pitch.load(Ordering::Relaxed));
+        if own > 0.0 && (self.settings.own_hz == 0.0 || (own / self.settings.own_hz - 1.0).abs() > 0.04) {
+            self.settings.own_hz = own;
+            changed = true;
+        }
+        if changed {
+            self.save();
+        }
+    }
+
     fn apply_controls(&self) {
         let s = &self.settings;
         let mut c = self.shared.controls.lock().unwrap();
@@ -371,6 +428,9 @@ impl Voice {
         c.deafened = s.deafened;
         c.denoise = s.clean;
         c.auto_gain = s.clean;
+        c.fx = if s.fx == dsp::Fx::Copy && s.copy_hz == 0.0 { dsp::Fx::Off } else { s.fx };
+        c.copy_hz = s.copy_hz;
+        c.own_hz = s.own_hz;
         c.volume = s.volume as f32 / 100.0;
         c.mic_gain = s.mic_gain as f32 / 100.0;
         c.threshold_db = s.threshold as f32;
@@ -416,6 +476,8 @@ impl Voice {
     fn leave(&mut self) {
         // The connection's threads stop as it drops.
         self.session = None;
+        self.check = None;
+        self.shared.rec.lock().unwrap().stop();
         self.shared.transmitting.store(false, Ordering::Relaxed);
         self.shared.talking.lock().unwrap().clear();
         *self.shared.status.lock().unwrap() = Status::Idle;
@@ -453,6 +515,8 @@ impl Voice {
             self.mixer.clone(),
             self.mic.clone(),
         ));
+        self.check = None;
+        let session = self.session.as_mut().expect("checked above");
         if session.audio.is_none() && SOUND_CARD.load(Ordering::Relaxed) {
             session.audio = Some(AudioIo::start(self.mixer.clone(), self.mic.clone(), self.devices.clone()));
         }
@@ -548,6 +612,18 @@ impl Voice {
             if volume.is_some() || muted {
                 self.apply_pref(id, volume.unwrap_or(100), muted);
             }
+        }
+
+        self.learn_pitches();
+        // The microphone test needs no server: with no voice connection it
+        // listens on its own.
+        let wants_check = (self.shared.controls.lock().unwrap().loopback || self.shared.rec.lock().unwrap().busy())
+            && SOUND_CARD.load(Ordering::Relaxed)
+            && self.session.as_ref().is_some_and(|s| s.conn.is_none());
+        if wants_check && self.check.is_none() {
+            self.check = Some(check::LocalCheck::start(self.shared.clone(), self.mixer.clone(), self.mic.clone(), self.devices.clone()));
+        } else if !wants_check {
+            self.check = None;
         }
 
         let protocol = self.settings.protocol;
@@ -702,6 +778,7 @@ impl Voice {
             groups,
             players: self.player_rows(head_of),
             loopback: self.shared.controls.lock().unwrap().loopback,
+            rec: self.shared.rec.lock().unwrap().view(48),
             hotkeys,
         }
     }
@@ -712,6 +789,7 @@ impl Voice {
         let own = session.secret.as_ref().map(|s| s.player);
         let eye = self.shared.listener.lock().unwrap().eye;
         let at = self.shared.players.lock().unwrap();
+        let copying = (self.settings.fx == dsp::Fx::Copy).then_some(self.settings.copy_id);
         let mut rows: Vec<ui::PlayerRow> = session
             .states
             .values()
@@ -734,6 +812,7 @@ impl Voice {
                     }),
                     volume,
                     muted,
+                    copied: copying == Some(p.uuid),
                 }
             })
             .collect();
@@ -769,9 +848,59 @@ impl Voice {
                 self.settings.deafened = !self.settings.deafened;
                 self.save();
             }
+            A::CopyVoice(id) => {
+                if self.settings.fx == dsp::Fx::Copy && self.settings.copy_id == id {
+                    self.reset_copy();
+                    self.menu.say("Your own voice again", false);
+                } else {
+                    let name = self.session.as_ref().and_then(|s| s.states.get(&id)).map(|p| p.name.clone()).unwrap_or_default();
+                    let hz = self.shared.pitches.lock().unwrap().get(&id).copied().unwrap_or(0.0);
+                    self.settings.fx = dsp::Fx::Copy;
+                    self.settings.copy_id = id;
+                    self.settings.copy_hz = hz;
+                    self.menu.say(
+                        if hz > 0.0 { format!("Copied {name}'s voice") } else { format!("Waiting to hear {name} talk") },
+                        false,
+                    );
+                    self.settings.copy_name = name;
+                }
+                self.save();
+            }
+            A::Fx => {
+                let next = self.settings.fx.next();
+                if self.settings.fx == dsp::Fx::Copy {
+                    self.reset_copy();
+                }
+                self.settings.fx = next;
+                self.save();
+            }
             A::Clean => {
                 self.settings.clean = !self.settings.clean;
                 self.save();
+            }
+            A::Record => {
+                let recording = self.shared.rec.lock().unwrap().state == rec::RecState::Recording;
+                if recording {
+                    self.shared.rec.lock().unwrap().stop();
+                    self.menu.say("Voice note saved. Press Play to hear it", false);
+                } else {
+                    self.shared.rec.lock().unwrap().start_recording();
+                    self.menu.say("Recording... say something (30 s at most)", false);
+                }
+            }
+            A::PlayNote => {
+                if self.shared.rec.lock().unwrap().state == rec::RecState::Playing {
+                    self.shared.rec.lock().unwrap().stop();
+                } else {
+                    let gain = self.shared.controls.lock().unwrap().volume.min(1.0);
+                    if !rec::play(&self.shared, &self.mixer, gain) {
+                        self.menu.say("Record something first", true);
+                    }
+                }
+            }
+            A::ClearNote => {
+                self.shared.rec.lock().unwrap().clear();
+                self.menu.say("Voice note deleted", false);
             }
             A::Loopback => {
                 let mut c = self.shared.controls.lock().unwrap();
@@ -1371,6 +1500,25 @@ mod tests {
         v.menu_action(ui::Action::Loopback);
         assert!(v.shared.controls.lock().unwrap().loopback);
         v.menu_action(ui::Action::Loopback);
+
+        // Copy voice: picks a player, and picking again lets go.
+        v.menu_action(ui::Action::CopyVoice(0xA));
+        assert_eq!((v.settings.fx, v.settings.copy_id), (dsp::Fx::Copy, 0xA));
+        // Nobody was heard yet, so nothing is changed in the voice so far.
+        assert_eq!(v.shared.controls.lock().unwrap().fx, dsp::Fx::Off);
+        // Once heard, the pitch is kept, even after that player leaves.
+        v.shared.pitches.lock().unwrap().insert(0xA, 180.0);
+        v.learn_pitches();
+        v.shared.pitches.lock().unwrap().clear();
+        assert_eq!(v.settings.copy_hz, 180.0);
+        assert_eq!(v.shared.controls.lock().unwrap().fx, dsp::Fx::Copy);
+        // It survives a restart.
+        let stored: HashMap<String, String> = v.settings.stored().into_iter().map(|(k, val)| (k.to_owned(), val)).collect();
+        let back = Settings::load(&|k| stored.get(k).cloned());
+        assert_eq!((back.fx, back.copy_hz, back.copy_id), (dsp::Fx::Copy, 180.0, 0xA));
+        // Picking the same player again, or the changer's button, lets go.
+        v.menu_action(ui::Action::CopyVoice(0xA));
+        assert_eq!((v.settings.fx, v.settings.copy_hz), (dsp::Fx::Off, 0.0));
     }
 
     #[test]

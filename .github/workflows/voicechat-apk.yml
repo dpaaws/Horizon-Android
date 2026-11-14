@@ -3,8 +3,8 @@ run-name: Voice chat APK · ${{ github.sha }}
 
 # Builds Horizon Android with the voice chat mod compiled in (native-mods/voicechat), for arm64-v8a.
 # Run it by hand: Actions > Voice chat APK (arm64) > Run workflow. The APK is the artifact of the run.
-# It installs beside the normal Horizon (package dev.horizon.android.dev) and is signed with a key made
-# during the build, so it never replaces your normal install or its worlds.
+# It installs beside the normal Horizon (package dev.horizon.android.dev). It is signed with the fixed key
+# packaging/android/voicechat-signing.bin, so each new build installs over the previous one as an update.
 on:
   workflow_dispatch:
 
@@ -57,6 +57,10 @@ jobs:
         run: packaging/android/voicechat_apply.sh
       - name: Prepare private engine inputs from official downloads
         run: python3 tools/android_prepare.py --java-home "$JAVA_HOME"
+      - name: Use the fixed signing key
+        run: |
+          mkdir -p .local/android
+          cp packaging/android/voicechat-signing.bin .local/android/debug.keystore
       - name: Build arm64 APK
         run: |
           python3 tools/android_build.py --abi arm64-v8a --public --profile release \

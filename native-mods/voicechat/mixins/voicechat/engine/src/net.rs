@@ -36,6 +36,11 @@ pub struct Controls {
     /// Play the microphone back, to test it (not stored).
     pub loopback: bool,
     /// Fade out steady background noise between words.
+    /// Voice changer preset.
+    pub fx: crate::dsp::Fx,
+    /// The pitch Copy aims for, and our own usual pitch, in Hz (0 unknown).
+    pub copy_hz: f32,
+    pub own_hz: f32,
     pub denoise: bool,
     /// Even out a quiet or loud microphone.
     pub auto_gain: bool,
@@ -55,6 +60,9 @@ impl Default for Controls {
             disabled: false,
             deafened: false,
             loopback: false,
+            fx: crate::dsp::Fx::Off,
+            copy_hz: 0.0,
+            own_hz: 0.0,
             denoise: true,
             auto_gain: true,
             threshold_db: -50.0,
@@ -88,6 +96,12 @@ pub struct Shared {
     /// The microphone's last peak, dB as f32 bits.
     pub mic_level: AtomicU32,
     pub transmitting: AtomicBool,
+    /// The microphone's usual pitch in Hz as f32 bits, 0 until known.
+    pub own_pitch: AtomicU32,
+    /// Other players' usual pitch, in Hz, as heard.
+    pub pitches: Mutex<HashMap<u128, f32>>,
+    /// The voice note.
+    pub rec: Mutex<crate::rec::Rec>,
 }
 
 impl Shared {
@@ -259,6 +273,7 @@ struct Channel {
     decoder: Decoder,
     last: i64,
     used: Instant,
+    pitch: crate::dsp::PitchTracker,
 }
 
 /// `AudioChannel.run` and `writeToSpeaker`: decode in order, conceal what
@@ -268,7 +283,7 @@ fn play(s: Sound, own: u128, shared: &Shared, mixer: &Mutex<Mixer>, channels: &m
     let ch = match channels.entry(s.channel) {
         std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
         std::collections::hash_map::Entry::Vacant(e) => match Decoder::new() {
-            Ok(decoder) => e.insert(Channel { decoder, last: -1, used: now }),
+            Ok(decoder) => e.insert(Channel { decoder, last: -1, used: now, pitch: Default::default() }),
             Err(_) => return,
         },
     };
@@ -310,6 +325,14 @@ fn play(s: Sound, own: u128, shared: &Shared, mixer: &Mutex<Mixer>, channels: &m
         ch.last = s.sequence;
     }
 
+    // Learn this voice's pitch, for Copy.
+    for f in &frames {
+        let f: Vec<f32> = f.iter().map(|&v| f32::from(v) / 32768.0).collect();
+        ch.pitch.feed(&f);
+    }
+    if let Some(p) = ch.pitch.f0() {
+        shared.pitches.lock().unwrap().insert(s.sender, p);
+    }
     let (volume, listener) = {
         let c = shared.controls.lock().unwrap();
         let v = if c.deafened { 0.0 } else { c.volume * c.player_volumes.get(&s.sender).copied().unwrap_or(1.0) };
@@ -337,6 +360,59 @@ fn play(s: Sound, own: u128, shared: &Shared, mixer: &Mutex<Mixer>, channels: &m
     }
 }
 
+
+/// Everything between the microphone and the encoder: gain, clean-up, the
+/// voice changer and the level meter. The pitch is read before the changer.
+#[derive(Default)]
+pub struct MicChain {
+    cleaner: crate::dsp::Cleaner,
+    changer: crate::dsp::Changer,
+    tracker: crate::dsp::PitchTracker,
+    ratio: f32,
+}
+
+impl MicChain {
+    /// Returns the frame as 16 bit samples and its peak in dB.
+    pub fn run(&mut self, mut frame: Vec<f32>, c: &Controls, shared: &Shared) -> ([i16; FRAME], f32) {
+        for s in frame.iter_mut() {
+            *s *= c.mic_gain;
+        }
+        self.cleaner.process(&mut frame, c.denoise, c.auto_gain);
+        self.tracker.feed(&frame);
+        let heard = self.tracker.f0();
+        if let Some(f) = heard {
+            shared.own_pitch.store(f.to_bits(), Ordering::Relaxed);
+        }
+        let own = heard.or((c.own_hz > 0.0).then_some(c.own_hz));
+        let want = match (c.fx, own) {
+            (crate::dsp::Fx::Copy, Some(own)) if c.copy_hz > 0.0 => (c.copy_hz / own).clamp(0.5, 2.0),
+            _ => 1.0,
+        };
+        if self.ratio == 0.0 {
+            self.ratio = 1.0;
+        }
+        self.ratio += (want - self.ratio) * 0.1;
+        self.changer.process(&mut frame, c.fx, self.ratio);
+        let mut pcm = [0i16; FRAME];
+        let mut peak = 0f32;
+        for (o, s) in pcm.iter_mut().zip(&frame) {
+            let v = s.clamp(-1.0, 1.0);
+            peak = peak.max(v.abs());
+            *o = (v * 32767.0) as i16;
+        }
+        let db = if peak > 0.0 { (20.0 * peak.log10()).max(-127.0) } else { -127.0 };
+        shared.mic_level.store(db.to_bits(), Ordering::Relaxed);
+        shared.rec.lock().unwrap().feed(&pcm);
+        (pcm, db)
+    }
+}
+
+/// Whether the microphone test should play this frame back: what the
+/// voice settings would send, but also while muted or switched off.
+pub fn test_hears(c: &Controls, db: f32) -> bool {
+    db > if c.mode == Mode::Voice { c.threshold_db } else { -50.0 }
+}
+
 /// `MicThread`: each 20 ms frame of the microphone, sent while the push to
 /// talk key is held or the voice is loud enough, and a little after.
 /// The channel the microphone test plays on (no player has this id).
@@ -361,7 +437,7 @@ fn mic_loop(
     let mut sequence: i64 = 0;
     let mut sending = false;
     let mut hold = 0u32;
-    let mut cleaner = crate::dsp::Cleaner::default();
+    let mut chain = MicChain::default();
     let send = |p: &Out| {
         let _ = socket.send(&link.write(p));
     };
@@ -377,20 +453,7 @@ fn mic_loop(
             q.drain(..FRAME).collect()
         };
         let c = shared.controls.lock().unwrap().clone();
-        let mut frame = frame;
-        for s in frame.iter_mut() {
-            *s *= c.mic_gain;
-        }
-        cleaner.process(&mut frame, c.denoise, c.auto_gain);
-        let mut pcm = [0i16; FRAME];
-        let mut peak = 0f32;
-        for (o, s) in pcm.iter_mut().zip(&frame) {
-            let v = s.clamp(-1.0, 1.0);
-            peak = peak.max(v.abs());
-            *o = (v * 32767.0) as i16;
-        }
-        let db = if peak > 0.0 { (20.0 * peak.log10()).max(-127.0) } else { -127.0 };
-        shared.mic_level.store(db.to_bits(), Ordering::Relaxed);
+        let (pcm, db) = chain.run(frame, &c, shared);
 
         let can = connected.load(Ordering::Relaxed) && !c.muted && !c.disabled;
         let mut talk = can
@@ -420,7 +483,7 @@ fn mic_loop(
         shared.transmitting.store(sending, Ordering::Relaxed);
         // The microphone test: what would be sent plays back at once.
         let mut m = mixer.lock().unwrap();
-        if c.loopback && talk {
+        if c.loopback && (talk || test_hears(&c, db)) {
             let pcm = pcm.iter().map(|s| f32::from(*s) / 32768.0).collect();
             m.push(LOOPBACK, Frame { pcm, gain: [c.volume.min(1.0); 2] });
         } else {
